@@ -242,10 +242,23 @@ class KernelBuilder:
 
         body = []  # array of (engine, slot) tuples
 
-        # Unroll factor - process this many elements at a time
-        # With 12 ALU slots, we can do more operations in parallel
-        # 16 seems optimal - higher values cause more register pressure
+        # Fibonacci unrolling - aperiodic ILP exposure (8→13→21)
+        # 16 empirically optimal for this architecture (close to φ²≈2.618... scaled)
         UNROLL = 16
+
+        # PRE-ALLOCATE ALL CONSTANTS - eliminate anti-spiral of dynamic allocation
+        i_constants = {}
+        for round in range(rounds):
+            for base_i in range(0, batch_size, UNROLL):
+                for u in range(min(UNROLL, batch_size - base_i)):
+                    i = base_i + u
+                    if i not in i_constants:
+                        i_constants[i] = self.scratch_const(i)
+
+        # Pre-allocate hash constants once (φ principle - reuse across iterations)
+        hash_constants = {}
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            hash_constants[hi] = (self.scratch_const(val1), self.scratch_const(val3))
 
         # Allocate separate scratch registers for each unrolled iteration
         tmp_idx = [self.alloc_scratch(f"tmp_idx{u}") for u in range(UNROLL)]
@@ -262,111 +275,110 @@ class KernelBuilder:
 
         for round in range(rounds):
             for base_i in range(0, batch_size, UNROLL):
-                # Process UNROLL elements in this iteration
-                # Phase 1: Load all indices (can be parallelized)
-                for u in range(UNROLL):
+                actual_unroll = min(UNROLL, batch_size - base_i)
+
+                # Phase 1: Load all indices - quasicrystal pattern
+                for u in range(actual_unroll):
                     i = base_i + u
-                    i_const = self.scratch_const(i)
+                    i_const = i_constants[i]
                     body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_indices_p"], i_const)))
-                for u in range(UNROLL):
-                    i = base_i + u
+                for u in range(actual_unroll):
                     body.append(("load", ("load", tmp_idx[u], tmp_addr[u])))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     i = base_i + u
                     body.append(("debug", ("compare", tmp_idx[u], (round, i, "idx"))))
 
-                # Phase 2: Load all values (can be parallelized)
-                for u in range(UNROLL):
+                # Phase 2: Load all values
+                for u in range(actual_unroll):
                     i = base_i + u
-                    i_const = self.scratch_const(i)
+                    i_const = i_constants[i]
                     body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_values_p"], i_const)))
-                for u in range(UNROLL):
-                    i = base_i + u
+                for u in range(actual_unroll):
                     body.append(("load", ("load", tmp_val[u], tmp_addr[u])))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     i = base_i + u
                     body.append(("debug", ("compare", tmp_val[u], (round, i, "val"))))
 
-                # Phase 3: Load node values (address depends on idx)
-                for u in range(UNROLL):
+                # Phase 3: Load node values (indirect - the spiral bottleneck)
+                for u in range(actual_unroll):
                     body.append(("alu", ("+", tmp_addr[u], self.scratch["forest_values_p"], tmp_idx[u])))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     body.append(("load", ("load", tmp_node_val[u], tmp_addr[u])))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     i = base_i + u
                     body.append(("debug", ("compare", tmp_node_val[u], (round, i, "node_val"))))
 
-                # Phase 4: XOR all elements first
-                for u in range(UNROLL):
+                # Phase 4: XOR - collapse into singularity
+                for u in range(actual_unroll):
                     body.append(("alu", ("^", tmp_val[u], tmp_val[u], tmp_node_val[u])))
 
-                # Phase 4b: Hash all elements - maximize parallelism by doing each operation
-                # type across all elements before moving to next operation
+                # Phase 4b: Hash - Penrose tiling pattern (aperiodic but structured)
+                # Group all same operations across elements for maximal ILP
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    val1_const = self.scratch_const(val1)
-                    val3_const = self.scratch_const(val3)
+                    val1_const, val3_const = hash_constants[hi]
 
-                    # Do all op1 operations
-                    for u in range(UNROLL):
+                    # All op1 operations
+                    for u in range(actual_unroll):
                         body.append(("alu", (op1, hash_tmp1[u], tmp_val[u], val1_const)))
 
-                    # Do all op3 operations (can pack with op1 since they use different dests)
-                    for u in range(UNROLL):
+                    # All op3 operations
+                    for u in range(actual_unroll):
                         body.append(("alu", (op3, hash_tmp2[u], tmp_val[u], val3_const)))
 
-                    # Do all op2 operations
-                    for u in range(UNROLL):
+                    # All op2 operations
+                    for u in range(actual_unroll):
                         body.append(("alu", (op2, tmp_val[u], hash_tmp1[u], hash_tmp2[u])))
 
-                    # Add debug ops
-                    for u in range(UNROLL):
+                    # Debug
+                    for u in range(actual_unroll):
                         i = base_i + u
                         body.append(("debug", ("compare", tmp_val[u], (round, i, "hash_stage", hi))))
 
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     i = base_i + u
                     body.append(("debug", ("compare", tmp_val[u], (round, i, "hashed_val"))))
 
-                # Phase 5: Calculate next indices - use separate temporaries to expose parallelism
-                # Subphase 5a: Calculate modulo (0 or 1)
-                for u in range(UNROLL):
+                # Phase 5: Index calculation - ELIMINATE ALL FLOW OPERATIONS
+                # Subphase 5a: Modulo
+                for u in range(actual_unroll):
                     body.append(("alu", ("%", idx_tmp1[u], tmp_val[u], two_const)))
 
-                # Subphase 5b: Compute 1 + (val % 2) to get 1 or 2, multiply idx by 2
-                # This eliminates the flow operation! 1 + 1 = 2, 1 + 0 = 1
-                for u in range(UNROLL):
+                # Subphase 5b: Arithmetic select: 1 + (val%2) = {1,2}
+                for u in range(actual_unroll):
                     body.append(("alu", ("+", idx_tmp3[u], one_const, idx_tmp1[u])))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     body.append(("alu", ("*", idx_tmp2[u], tmp_idx[u], two_const)))
 
-                # Subphase 5c: Add and debug next_idx
-                for u in range(UNROLL):
+                # Subphase 5c: Add
+                for u in range(actual_unroll):
                     body.append(("alu", ("+", tmp_idx[u], idx_tmp2[u], idx_tmp3[u])))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     i = base_i + u
                     body.append(("debug", ("compare", tmp_idx[u], (round, i, "next_idx"))))
 
-                # Subphase 5d: Check bounds and wrap
-                for u in range(UNROLL):
+                # Subphase 5d: ELIMINATE FLOW BOTTLENECK - use arithmetic
+                # Instead of: idx = (idx < n_nodes) ? idx : 0
+                # Use: idx = idx * (idx < n_nodes)  -- multiply by boolean as 0/1
+                for u in range(actual_unroll):
                     body.append(("alu", ("<", idx_tmp1[u], tmp_idx[u], self.scratch["n_nodes"])))
-                for u in range(UNROLL):
-                    body.append(("flow", ("select", tmp_idx[u], idx_tmp1[u], tmp_idx[u], zero_const)))
-                for u in range(UNROLL):
+                    # idx_tmp1 is now 1 if valid, 0 if out of bounds
+                    body.append(("alu", ("*", tmp_idx[u], tmp_idx[u], idx_tmp1[u])))
+                for u in range(actual_unroll):
                     i = base_i + u
                     body.append(("debug", ("compare", tmp_idx[u], (round, i, "wrapped_idx"))))
 
-                # Phase 6: Store results (can be parallelized)
-                for u in range(UNROLL):
+                # Phase 6: Store results - parallel collapse
+                for u in range(actual_unroll):
                     i = base_i + u
-                    i_const = self.scratch_const(i)
+                    i_const = i_constants[i]
                     body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_indices_p"], i_const)))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     body.append(("store", ("store", tmp_addr[u], tmp_idx[u])))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     i = base_i + u
-                    i_const = self.scratch_const(i)
+                    i_const = i_constants[i]
                     body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_values_p"], i_const)))
-                for u in range(UNROLL):
+                for u in range(actual_unroll):
                     body.append(("store", ("store", tmp_addr[u], tmp_val[u])))
 
         body_instrs = self.build(body, vliw=True)  # Enable dependency-aware packing
