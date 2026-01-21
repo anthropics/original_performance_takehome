@@ -10,11 +10,20 @@ Optimize `build_kernel()` using genetic algorithm with mutate and crossover agen
 
 ## Parameters (from $ARGUMENTS, format: --key=value)
 
-- `--population=10` - number of candidates
+- `--population=10` - population size (kept constant each generation)
 - `--generations=10` - number of generations
-- `--elite=3` - top candidates preserved unchanged
-- `--crossover-rate=0.8` - probability of crossover
-- `--mutation-rate=0.2` - probability of mutation
+- `--offspring=7` - number of offspring per generation
+- `--crossover-rate=0.8` - probability of crossover vs mutation
+- `--mutation-rate=0.2` - (unused, crossover-rate determines split)
+
+## Pool-Based Selection Model
+
+This implementation uses a proper genetic algorithm with pool-based selection:
+
+1. **Parents are never modified** - offspring are always new candidates
+2. **Offspring get new IDs** - IDs grow over time (011, 012, etc.)
+3. **Selection keeps best N** - after creating offspring, keep top `population` candidates
+4. **Eliminated candidates are deleted** - cleanup after selection
 
 ## Progress File
 
@@ -39,11 +48,14 @@ All scripts are in `./scripts/`:
 | Script | Purpose | Output |
 |--------|---------|--------|
 | `init_population.sh {n}` | Initialize N candidates | "Created N candidates" |
-| `plan_generation.sh {gen} {elite} {cr} {mr}` | Plan generation operations | ELITE/CROSSOVER/MUTATE/EVAL lines |
+| `plan_generation.sh {gen} {offspring} {cr} {mr}` | Plan offspring operations | CROSSOVER/MUTATE/EVAL lines |
 | `update_score.sh {id} {cycles}` | Update single score | Re-sorts scores.txt |
 | `get_stats.sh [baseline]` | Get population stats | BEST/AVG/IMPROVEMENT lines |
 | `eval_candidate.sh {id}` | Evaluate single candidate | Cycle count |
 | `save_best.sh {id}` | Save best to `best/` | Copies perf_takehome.py |
+| `select_survivors.sh {n}` | Keep top N, delete rest | KEPT/DELETED lists |
+| `copy_candidate.sh {src} {dest}` | Copy candidate folder | "Copied src to dest" |
+| `next_candidate_id.sh` | Get next available ID | Next ID (e.g., "011") |
 
 ### Low-Level Scripts (used by high-level scripts)
 
@@ -52,10 +64,8 @@ All scripts are in `./scripts/`:
 | `init_candidate.sh {id}` | Create single candidate folder |
 | `eval_all.sh` | Evaluate all candidates |
 | `get_elite.sh {n}` | Get top N candidate IDs |
-| `get_non_elite.sh {n}` | Get non-elite IDs |
 | `select_parents.sh {seed}` | Tournament selection |
-| `should_crossover.sh {rate} {seed}` | Decide crossover |
-| `should_mutate.sh {rate} {seed}` | Decide mutation |
+| `should_crossover.sh {rate} {seed}` | Decide crossover vs mutation |
 | `parents_identical.sh {p1} {p2}` | Check if parents identical |
 
 ## Workflow
@@ -102,23 +112,24 @@ For each generation 1 to N:
 #### 4a. Get the Plan
 
 ```bash
-./scripts/plan_generation.sh $GEN $ELITE $CROSSOVER_RATE $MUTATION_RATE
+./scripts/plan_generation.sh $GEN $NUM_OFFSPRING $CROSSOVER_RATE $MUTATION_RATE
 ```
 
 Example output:
 ```
-ELITE: 001 002 003
-CROSSOVER: 001 002 004
-CROSSOVER: 001 003 005
-MUTATE: 004
-MUTATE: 006
-EVAL: 004 005 006
+CROSSOVER: 001 002 011
+CROSSOVER: 001 003 012
+MUTATE: 002 013
+MUTATE: 001 014
+EVAL: 011 012 013 014
 ```
 
 Parse this output to get:
-- `CROSSOVER` lines → crossover tasks
-- `MUTATE` lines → mutation tasks
-- `EVAL` line → candidates to re-evaluate
+- `CROSSOVER` lines → crossover tasks (parent1, parent2, child_id)
+- `MUTATE` lines → mutation tasks (parent, child_id)
+- `EVAL` line → all new offspring to evaluate
+
+**Note**: The plan creates placeholder directories for offspring, so next_candidate_id works correctly.
 
 #### 4b. Execute Crossovers (PARALLEL)
 
@@ -129,16 +140,28 @@ For each `CROSSOVER: p1 p2 child` line:
 Task(crossover, "CAND_{p1} CAND_{p2} CAND_{child}")
 ```
 
+The crossover agent will:
+1. Run `./scripts/copy_candidate.sh {p1} {child}` to copy parent1
+2. Read both parents
+3. Edit child to incorporate elements from parent2
+4. Test correctness
+
 #### 4c. Execute Mutations (PARALLEL)
 
 **CRITICAL: Launch ALL mutate agents in ONE message**
 
-For each `MUTATE: id` line:
+For each `MUTATE: parent child` line:
 ```
-Task(mutate, "CAND_{id}")
+Task(mutate, "CAND_{parent} CAND_{child}")
 ```
 
-#### 4d. Re-evaluate Modified Candidates (PARALLEL)
+The mutate agent will:
+1. Run `./scripts/copy_candidate.sh {parent} {child}` to copy parent
+2. Read child file
+3. Make ONE small mutation
+4. Test correctness
+
+#### 4d. Evaluate Offspring (PARALLEL)
 
 **CRITICAL: Run ALL evaluations in ONE message**
 
@@ -152,7 +175,15 @@ Then update scores:
 ./scripts/update_score.sh {id} {cycles}
 ```
 
-#### 4e. Update Best & Log
+#### 4e. Select Survivors
+
+```bash
+./scripts/select_survivors.sh $POPULATION_SIZE
+```
+
+This keeps the top N candidates and **deletes** the rest, maintaining constant population size.
+
+#### 4f. Update Best & Log
 
 ```bash
 ./scripts/get_stats.sh $BASELINE
@@ -171,14 +202,15 @@ Log generation summary and write `=== Generation N COMPLETE ===`
 1. **PARALLEL CROSSOVERS**: Launch ALL crossover agents in ONE message
 2. **PARALLEL MUTATIONS**: Launch ALL mutate agents in ONE message
 3. **PARALLEL EVALS**: Run ALL evaluations in ONE message
-4. **AGENT ARGS**: Pass ONLY candidate IDs - no hints, no bias
-   - mutate: `CAND_{id}`
+4. **NEVER MODIFY PARENTS**: Always create new candidates for offspring
+5. **AGENT ARGS**: Pass ONLY candidate IDs - no hints, no bias
+   - mutate: `CAND_{parent} CAND_{child}`
    - crossover: `CAND_{parent1} CAND_{parent2} CAND_{child}`
 
 ## Log Format
 
 ```
-[START] Fresh optimization run | pop=10, gen=10, elite=3
+[START] Fresh optimization run | pop=10, gen=10, offspring=7
 [INIT] Created 10 candidates
 
 === Generation 0 ===
@@ -187,19 +219,23 @@ Baseline: 147734 cycles
 
 === Generation 1 ===
 [PLAN]
-ELITE: 001 002 003
-CROSSOVER: 001 002 004
-MUTATE: 004 006
-EVAL: 004 006
+CROSSOVER: 001 002 011
+CROSSOVER: 001 003 012
+MUTATE: 002 013
+EVAL: 011 012 013
 
-[CROSSOVER] 004: combined VLIW packing with memory layout
-[MUTATE] 004: reordered memory accesses
-[MUTATE] 006: unrolled inner loop
-[EVAL] 004: 142000 cycles
-[EVAL] 006: 148000 cycles
+[CROSSOVER] 011: combined loop unrolling with VLIW packing
+[CROSSOVER] 012: combined memory layout with instruction reordering
+[MUTATE] 013: replaced modulo with bitwise AND
+[EVAL] 011: 142000 cycles
+[EVAL] 012: 145000 cycles
+[EVAL] 013: 143500 cycles
 
-BEST: 004 142000
-AVG: 145234
+[SELECT] Kept: 001 002 003 011 012 013 004 005 006 007
+[SELECT] Deleted: 008 009 010
+
+BEST: 011 142000
+AVG: 144500
 IMPROVEMENT: 3.9%
 === Generation 1 COMPLETE ===
 ```
@@ -207,3 +243,4 @@ IMPROVEMENT: 3.9%
 **Key markers for resumption:**
 - `=== Generation N COMPLETE ===` - generation fully finished
 - `[EVAL] {id}:` - individual evaluations (mid-generation recovery)
+- `[SELECT]` - selection completed

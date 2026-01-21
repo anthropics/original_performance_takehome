@@ -17,8 +17,9 @@ mkdir -p "$ROOT_DIR/candidates"
 touch "$ROOT_DIR/candidates/__init__.py"
 
 # Initialize each candidate
-for i in $(seq -w 1 "$N"); do
-    ID=$(printf "%03d" "$i")
+for i in $(seq 1 "$N"); do
+    # Use 10# prefix to force decimal interpretation (avoids octal issues with 08, 09)
+    ID=$(printf "%03d" "$((10#$i))")
     "$SCRIPT_DIR/init_candidate.sh" "$ID"
     touch "$ROOT_DIR/candidates/CAND_$ID/__init__.py"
 done

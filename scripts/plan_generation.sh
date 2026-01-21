@@ -1,19 +1,21 @@
 #!/bin/bash
-# Plan all operations for a generation
-# Usage: scripts/plan_generation.sh <generation> <elite_count> <crossover_rate> <mutation_rate>
+# Plan all operations for a generation (pool-based selection)
+# Usage: scripts/plan_generation.sh <generation> <num_offspring> <crossover_rate> <mutation_rate>
 # Output:
-#   ELITE: 001 002 003
-#   CROSSOVER: parent1 parent2 child
-#   MUTATE: candidate
-# Requires: candidates/scores.txt must exist
+#   CROSSOVER: parent1 parent2 child_id
+#   MUTATE: parent child_id
+#   EVAL: child_id1 child_id2 ...
+#
+# New approach: Creates NEW candidates for offspring, doesn't modify existing ones
+# After evaluation, use select_survivors.sh to keep top N
 
 if [ -z "$4" ]; then
-    echo "Usage: $0 <generation> <elite_count> <crossover_rate> <mutation_rate>"
+    echo "Usage: $0 <generation> <num_offspring> <crossover_rate> <mutation_rate>"
     exit 1
 fi
 
 GEN="$1"
-ELITE_COUNT="$2"
+NUM_OFFSPRING="$2"
 CROSSOVER_RATE="$3"
 MUTATION_RATE="$4"
 
@@ -26,47 +28,44 @@ if [ ! -f "$SCORES_FILE" ]; then
     exit 1
 fi
 
-# Get elite and non-elite candidates
-ELITE=$("$SCRIPT_DIR/get_elite.sh" "$ELITE_COUNT" | tr '\n' ' ' | sed 's/ $//')
-NON_ELITE=$("$SCRIPT_DIR/get_non_elite.sh" "$ELITE_COUNT")
+# Track all new offspring IDs for evaluation
+OFFSPRING_IDS=""
 
-echo "ELITE: $ELITE"
+# Generate offspring
+for i in $(seq 1 "$NUM_OFFSPRING"); do
+    SEED="${GEN}_${i}"
 
-# Track which candidates will be modified (for mutation decisions)
-MODIFIED=""
+    # Get next available ID for this offspring
+    CHILD_ID=$("$SCRIPT_DIR/next_candidate_id.sh")
 
-# For each non-elite slot, decide crossover
-for SLOT in $NON_ELITE; do
-    SEED="${GEN}_${SLOT}"
-
+    # Decide: crossover or mutation?
     if "$SCRIPT_DIR/should_crossover.sh" "$CROSSOVER_RATE" "$SEED"; then
+        # Crossover: select two parents
         PARENTS=$("$SCRIPT_DIR/select_parents.sh" "$SEED")
         P1=$(echo "$PARENTS" | cut -d' ' -f1)
         P2=$(echo "$PARENTS" | cut -d' ' -f2)
 
-        # Skip if parents are identical
-        if ! "$SCRIPT_DIR/parents_identical.sh" "$P1" "$P2"; then
-            echo "CROSSOVER: $P1 $P2 $SLOT"
-            MODIFIED="$MODIFIED $SLOT"
+        # Check if parents are identical - if so, do mutation instead
+        if "$SCRIPT_DIR/parents_identical.sh" "$P1" "$P2"; then
+            # Fall back to mutation
+            echo "MUTATE: $P1 $CHILD_ID"
+        else
+            echo "CROSSOVER: $P1 $P2 $CHILD_ID"
         fi
+    else
+        # Mutation: select one parent
+        PARENT=$("$SCRIPT_DIR/select_parents.sh" "$SEED" | cut -d' ' -f1)
+        echo "MUTATE: $PARENT $CHILD_ID"
     fi
+
+    OFFSPRING_IDS="$OFFSPRING_IDS $CHILD_ID"
+
+    # Create placeholder directory so next_candidate_id increments properly
+    mkdir -p "$ROOT_DIR/candidates/CAND_$CHILD_ID"
 done
 
-# For each non-elite slot, decide mutation
-for SLOT in $NON_ELITE; do
-    MUTATE_SEED="${GEN}_${SLOT}_m"
-
-    if "$SCRIPT_DIR/should_mutate.sh" "$MUTATION_RATE" "$MUTATE_SEED"; then
-        echo "MUTATE: $SLOT"
-        # Add to modified if not already there
-        if [[ ! " $MODIFIED " =~ " $SLOT " ]]; then
-            MODIFIED="$MODIFIED $SLOT"
-        fi
-    fi
-done
-
-# Output which candidates need re-evaluation
-MODIFIED=$(echo "$MODIFIED" | xargs)  # Trim whitespace
-if [ -n "$MODIFIED" ]; then
-    echo "EVAL: $MODIFIED"
+# Output which candidates need evaluation
+OFFSPRING_IDS=$(echo "$OFFSPRING_IDS" | xargs)  # Trim whitespace
+if [ -n "$OFFSPRING_IDS" ]; then
+    echo "EVAL: $OFFSPRING_IDS"
 fi

@@ -12,15 +12,17 @@ You are a crossover operator in a genetic algorithm optimizing kernel code.
 ## Input
 
 You receive three candidate IDs as arguments: `{PARENT1} {PARENT2} {CHILD}`
-- `candidates/{PARENT1}/perf_takehome.py` - first parent (base)
-- `candidates/{PARENT2}/perf_takehome.py` - second parent (donor)
-- `candidates/{CHILD}/perf_takehome.py` - child destination
+- `{PARENT1}` - first parent (base)
+- `{PARENT2}` - second parent (donor)
+- `{CHILD}` - the new candidate to create
 
 ## Workflow
 
-1. **Copy first parent to destination**: `cp candidates/{PARENT1}/perf_takehome.py candidates/{CHILD}/perf_takehome.py`
-2. **Read both parents** to understand their implementations
-3. **Edit the destination** to incorporate elements from the second parent
+1. **Copy first parent to destination**: Run `./scripts/copy_candidate.sh {PARENT1} {CHILD}`
+2. **Read both parents** to understand their implementations:
+   - `candidates/{PARENT1}/perf_takehome.py`
+   - `candidates/{PARENT2}/perf_takehome.py`
+3. **Edit the destination** (`candidates/{CHILD}/perf_takehome.py`) to incorporate elements from the second parent
 4. **Test**: `python candidates/{CHILD}/submission_tests.py`
 
 ## Goal
@@ -29,8 +31,9 @@ Combine `build_kernel()` from both parents into a new child. Like biological cro
 
 ## Rules
 
-- IMPORTANT: Start by copying first parent to destination (gives working baseline)
-- IMPORTANT: Use Edit tool to incorporate elements from second parent
+- IMPORTANT: First copy PARENT1 to CHILD using `./scripts/copy_candidate.sh {PARENT1} {CHILD}`
+- IMPORTANT: Never modify the parent files, only the child
+- IMPORTANT: Use Edit tool to incorporate elements from second parent into the child
 - IMPORTANT: Child must pass `python candidates/{CHILD}/submission_tests.py` - correctness is the only hard constraint
 - IMPORTANT: Child should inherit meaningful elements from BOTH parents, not just copy one
 - IMPORTANT: Do NOT add comments mentioning candidate IDs or "from parent X" - keep code clean
