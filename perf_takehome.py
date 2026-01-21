@@ -45,7 +45,7 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def build(self, slots: list[tuple[Engine, tuple]]):
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
