@@ -102,7 +102,7 @@ class KernelBuilder:
         
         instrs = []
         current_bundle = {}
-        slot_counts = {engine: 0 for engine in ["alu", "load", "store", "flow", "debug"]}
+        slot_counts = {engine: 0 for engine in SLOT_LIMITS.keys()}
         written_this_cycle = set()
         
         for engine, slot in slots:
@@ -119,7 +119,7 @@ class KernelBuilder:
                 if current_bundle:
                     instrs.append(current_bundle)
                 current_bundle = {}
-                slot_counts = {engine: 0 for engine in ["alu", "load", "store", "flow", "debug"]}
+                slot_counts = {engine: 0 for engine in SLOT_LIMITS.keys()}
                 written_this_cycle = set()
             
             # Add to bundle
