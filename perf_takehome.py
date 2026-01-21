@@ -226,11 +226,17 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Unroll factor for vector iterations (process this many VLEN-vectors at once)
-        VECTOR_UNROLL = 16  # Process 16*8=128 elements at once for maximum ILP
+        VECTOR_UNROLL = 16  # Process 16*8=128 elements at once
+        
+        # Allocate a shared pool of address registers for irregular loads
+        # These can be reused across unrolled iterations since they're only needed briefly
+        shared_addr_pool = [self.alloc_scratch(f"shared_addr{i}") for i in range(VLEN * VECTOR_UNROLL)]
         
         # Allocate vector register sets for unrolled iterations
         unroll_vregs = []
         for u in range(VECTOR_UNROLL):
+            # Use a slice of the shared address pool for this iteration
+            addr_regs = shared_addr_pool[u * VLEN : (u + 1) * VLEN]
             unroll_vregs.append({
                 'idx': self.alloc_scratch(f"vu{u}_idx", VLEN),
                 'val': self.alloc_scratch(f"vu{u}_val", VLEN),
@@ -238,7 +244,8 @@ class KernelBuilder:
                 'tmp1': self.alloc_scratch(f"vu{u}_tmp1", VLEN),
                 'tmp2': self.alloc_scratch(f"vu{u}_tmp2", VLEN),
                 'tmp3': self.alloc_scratch(f"vu{u}_tmp3", VLEN),
-                'addr': self.alloc_scratch(f"vu{u}_addr"),
+                'base_addr': self.alloc_scratch(f"vu{u}_base"),
+                'addr_regs': addr_regs,
             })
         
         # Scalar temporaries for addressing
@@ -280,10 +287,10 @@ class KernelBuilder:
                         i_offset = i_base + u * VLEN
                         i_const = self.scratch_const(i_offset)
                         reg = unroll_vregs[u]
-                        body.append(("alu", ("+", reg['addr'], self.scratch["inp_indices_p"], i_const)))
+                        body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_indices_p"], i_const)))
                     for u in range(effective_unroll):
                         reg = unroll_vregs[u]
-                        body.append(("load", ("vload", reg['idx'], reg['addr'])))
+                        body.append(("load", ("vload", reg['idx'], reg['base_addr'])))
                     for u in range(effective_unroll):
                         i_offset = i_base + u * VLEN
                         reg = unroll_vregs[u]
@@ -295,23 +302,27 @@ class KernelBuilder:
                         i_offset = i_base + u * VLEN
                         i_const = self.scratch_const(i_offset)
                         reg = unroll_vregs[u]
-                        body.append(("alu", ("+", reg['addr'], self.scratch["inp_values_p"], i_const)))
+                        body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_values_p"], i_const)))
                     for u in range(effective_unroll):
                         reg = unroll_vregs[u]
-                        body.append(("load", ("vload", reg['val'], reg['addr'])))
+                        body.append(("load", ("vload", reg['val'], reg['base_addr'])))
                     for u in range(effective_unroll):
                         i_offset = i_base + u * VLEN
                         reg = unroll_vregs[u]
                         for vi in range(VLEN):
                             body.append(("debug", ("compare", reg['val'] + vi, (round, i_offset + vi, "val"))))
                     
-                    # Stage 3: Irregular loads for forest_values (interleave across unrolled iterations)
-                    for vi in range(VLEN):
-                        for u in range(effective_unroll):
-                            i_offset = i_base + u * VLEN
-                            reg = unroll_vregs[u]
-                            body.append(("alu", ("+", addr_tmp, self.scratch["forest_values_p"], reg['idx'] + vi)))
-                            body.append(("load", ("load", reg['node_val'] + vi, addr_tmp)))
+                    # Stage 3: Irregular loads - compute ALL addresses first, then ALL loads
+                    # This allows maximum parallelism in both address computation and loads
+                    for u in range(effective_unroll):
+                        reg = unroll_vregs[u]
+                        for vi in range(VLEN):
+                            body.append(("alu", ("+", reg['addr_regs'][vi], self.scratch["forest_values_p"], reg['idx'] + vi)))
+                    for u in range(effective_unroll):
+                        i_offset = i_base + u * VLEN
+                        reg = unroll_vregs[u]
+                        for vi in range(VLEN):
+                            body.append(("load", ("load", reg['node_val'] + vi, reg['addr_regs'][vi])))
                             body.append(("debug", ("compare", reg['node_val'] + vi, (round, i_offset + vi, "node_val"))))
                     
                     # Stage 4: Vector XOR (all unrolled iterations)
@@ -369,10 +380,10 @@ class KernelBuilder:
                         i_offset = i_base + u * VLEN
                         i_const = self.scratch_const(i_offset)
                         reg = unroll_vregs[u]
-                        body.append(("alu", ("+", reg['addr'], self.scratch["inp_indices_p"], i_const)))
-                        body.append(("store", ("vstore", reg['addr'], reg['idx'])))
-                        body.append(("alu", ("+", reg['addr'], self.scratch["inp_values_p"], i_const)))
-                        body.append(("store", ("vstore", reg['addr'], reg['val'])))
+                        body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_indices_p"], i_const)))
+                        body.append(("store", ("vstore", reg['base_addr'], reg['idx'])))
+                        body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_values_p"], i_const)))
+                        body.append(("store", ("vstore", reg['base_addr'], reg['val'])))
                 else:
                     # Partial unroll or scalar tail loop
                     for u in range(effective_unroll):
@@ -382,19 +393,20 @@ class KernelBuilder:
                             i_const = self.scratch_const(i_offset)
                             reg = unroll_vregs[0]  # Reuse first register set
                             
-                            body.append(("alu", ("+", reg['addr'], self.scratch["inp_indices_p"], i_const)))
-                            body.append(("load", ("vload", reg['idx'], reg['addr'])))
+                            body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_indices_p"], i_const)))
+                            body.append(("load", ("vload", reg['idx'], reg['base_addr'])))
                             for vi in range(VLEN):
                                 body.append(("debug", ("compare", reg['idx'] + vi, (round, i_offset + vi, "idx"))))
                             
-                            body.append(("alu", ("+", reg['addr'], self.scratch["inp_values_p"], i_const)))
-                            body.append(("load", ("vload", reg['val'], reg['addr'])))
+                            body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_values_p"], i_const)))
+                            body.append(("load", ("vload", reg['val'], reg['base_addr'])))
                             for vi in range(VLEN):
                                 body.append(("debug", ("compare", reg['val'] + vi, (round, i_offset + vi, "val"))))
                             
                             for vi in range(VLEN):
-                                body.append(("alu", ("+", addr_tmp, self.scratch["forest_values_p"], reg['idx'] + vi)))
-                                body.append(("load", ("load", reg['node_val'] + vi, addr_tmp)))
+                                body.append(("alu", ("+", reg['addr_regs'][vi], self.scratch["forest_values_p"], reg['idx'] + vi)))
+                            for vi in range(VLEN):
+                                body.append(("load", ("load", reg['node_val'] + vi, reg['addr_regs'][vi])))
                                 body.append(("debug", ("compare", reg['node_val'] + vi, (round, i_offset + vi, "node_val"))))
                             
                             body.append(("valu", ("^", reg['val'], reg['val'], reg['node_val'])))
@@ -422,10 +434,10 @@ class KernelBuilder:
                             for vi in range(VLEN):
                                 body.append(("debug", ("compare", reg['idx'] + vi, (round, i_offset + vi, "wrapped_idx"))))
                             
-                            body.append(("alu", ("+", reg['addr'], self.scratch["inp_indices_p"], i_const)))
-                            body.append(("store", ("vstore", reg['addr'], reg['idx'])))
-                            body.append(("alu", ("+", reg['addr'], self.scratch["inp_values_p"], i_const)))
-                            body.append(("store", ("vstore", reg['addr'], reg['val'])))
+                            body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_indices_p"], i_const)))
+                            body.append(("store", ("vstore", reg['base_addr'], reg['idx'])))
+                            body.append(("alu", ("+", reg['base_addr'], self.scratch["inp_values_p"], i_const)))
+                            body.append(("store", ("vstore", reg['base_addr'], reg['val'])))
                         else:
                             # Scalar tail
                             for i in range(i_offset, min(i_offset + VLEN, batch_size)):
