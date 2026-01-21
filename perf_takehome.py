@@ -226,7 +226,7 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Unroll factor for vector iterations (process this many VLEN-vectors at once)
-        VECTOR_UNROLL = 16  # Process 16*8=128 elements at once
+        VECTOR_UNROLL = 16  # Process 16 * VLEN elements at once
         
         # Allocate a shared pool of address registers for irregular loads
         # These can be reused across unrolled iterations since they're only needed briefly
