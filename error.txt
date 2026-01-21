@@ -1,0 +1,26 @@
+E
+======================================================================
+ERROR: test_kernel_cycles (__main__.Tests.test_kernel_cycles)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\perf_takehome.py", line 381, in test_kernel_cycles
+    do_kernel_test(10, 16, 256)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\perf_takehome.py", line 330, in do_kernel_test
+    machine.run()
+    ~~~~~~~~~~~^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 213, in run
+    self.step(instr, core)
+    ~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 387, in step
+    ENGINE_FNS[name](core, *slot)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 282, in load
+    self.scratch_write[dest + vi] = self.mem[addr + vi]
+                                    ~~~~~~~~^^^^^^^^^^^
+IndexError: list index out of range
+
+----------------------------------------------------------------------
+Ran 1 test in 0.059s
+
+FAILED (errors=1)

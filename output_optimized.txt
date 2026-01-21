@@ -1,0 +1,1 @@
+forest_height=10, rounds=16, batch_size=256

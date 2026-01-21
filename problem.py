@@ -278,7 +278,10 @@ class Machine:
                 ]
             case ("vload", dest, addr):  # addr is a scalar
                 addr = core.scratch[addr]
+                # print(f"DEBUG: vload dest={dest} addr={addr} mem_len={len(self.mem)}")
                 for vi in range(VLEN):
+                    if addr + vi >= len(self.mem):
+                         print(f"ERROR: vload OOB. addr={addr}, vi={vi}, len={len(self.mem)}")
                     self.scratch_write[dest + vi] = self.mem[addr + vi]
             case ("const", dest, val):
                 self.scratch_write[dest] = (val) % (2**32)
@@ -379,6 +382,9 @@ class Machine:
                         assert res == ref, (
                             f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
                         )
+                    elif slot[0] == "print_reg":
+                        loc, name = slot[1], slot[2]
+                        print(f"DEBUG: print_reg {name}@{loc} = {core.scratch[loc]}")
                 continue
             assert len(slots) <= SLOT_LIMITS[name]
             for i, slot in enumerate(slots):
