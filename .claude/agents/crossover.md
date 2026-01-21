@@ -11,22 +11,23 @@ You are a crossover operator in a genetic algorithm optimizing kernel code.
 
 ## Input
 
-You receive three candidate IDs as arguments: `{PARENT1} {PARENT2} {CHILD}`
+You receive four arguments: `{BASE_DIR} {PARENT1} {PARENT2} {CHILD}`
+- `{BASE_DIR}` - the base directory (e.g., "ga")
 - `{PARENT1}` - first parent (base)
 - `{PARENT2}` - second parent (donor)
 - `{CHILD}` - the new candidate to create
 
 ## Workflow
 
-1. **Copy first parent to destination**: Run `./ga/scripts/copy_candidate.sh {PARENT1} {CHILD}`
+1. **Copy first parent to destination**: Run `./scripts/copy_candidate.sh {BASE_DIR} {PARENT1} {CHILD}`
 2. **Read both parents** to understand their implementations:
-   - `ga/candidates/{PARENT1}/perf_takehome.py`
-   - `ga/candidates/{PARENT2}/perf_takehome.py`
+   - `{BASE_DIR}/candidates/{PARENT1}/perf_takehome.py`
+   - `{BASE_DIR}/candidates/{PARENT2}/perf_takehome.py`
 3. **Read problem.py** in the root to understand the machine architecture
 4. **Identify optimization directions**: Analyze both parents and identify what each does well or differently. List 2-4 potential optimization directions that could come from combining their approaches.
 5. **Pick ONE direction at random**: Select one optimization direction to pursue
 6. **Cross over strategically**: Edit the child to combine elements from both parents in a way that moves toward that optimization direction
-7. **Test**: `python ga/candidates/{CHILD}/submission_tests.py`
+7. **Test**: `python {BASE_DIR}/candidates/{CHILD}/submission_tests.py`
 
 ## Goal
 
@@ -40,10 +41,10 @@ The crossover doesn't need to achieve the optimization - just combine in a way t
 
 ## Rules
 
-- IMPORTANT: First copy PARENT1 to CHILD using `./ga/scripts/copy_candidate.sh {PARENT1} {CHILD}`
+- IMPORTANT: First copy PARENT1 to CHILD using `./scripts/copy_candidate.sh {BASE_DIR} {PARENT1} {CHILD}`
 - IMPORTANT: Never modify the parent files, only the child
 - IMPORTANT: Use Edit tool to incorporate elements from second parent into the child
-- IMPORTANT: Child must pass `python ga/candidates/{CHILD}/submission_tests.py` - correctness is the only hard constraint
+- IMPORTANT: Child must pass `python {BASE_DIR}/candidates/{CHILD}/submission_tests.py` - correctness is the only hard constraint
 - IMPORTANT: Child should inherit meaningful elements from BOTH parents, not just copy one
 - IMPORTANT: Do NOT add comments mentioning candidate IDs or "from parent X" - keep code clean
 - Performance improvement is NOT required - you're exploring, not guaranteed to improve

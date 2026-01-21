@@ -20,8 +20,9 @@ CROSSOVER_RATE="$3"
 MUTATION_RATE="$4"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-SCORES_FILE="$ROOT_DIR/candidates/scores.txt"
+GA_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$(dirname "$GA_DIR")"
+SCORES_FILE="$GA_DIR/candidates/scores.txt"
 
 if [ ! -f "$SCORES_FILE" ]; then
     echo "ERROR: scores.txt not found. Run eval_all.sh first."
@@ -35,8 +36,8 @@ OFFSPRING_IDS=""
 for i in $(seq 1 "$NUM_OFFSPRING"); do
     SEED="${GEN}_${i}"
 
-    # Get next available ID for this offspring
-    CHILD_ID=$("$SCRIPT_DIR/next_candidate_id.sh")
+    # Get next available ID for this offspring (using shared script)
+    CHILD_ID=$("$PROJECT_ROOT/scripts/next_candidate_id.sh" ga)
 
     # Decide: crossover or mutation?
     if "$SCRIPT_DIR/should_crossover.sh" "$CROSSOVER_RATE" "$SEED"; then
@@ -61,7 +62,7 @@ for i in $(seq 1 "$NUM_OFFSPRING"); do
     OFFSPRING_IDS="$OFFSPRING_IDS $CHILD_ID"
 
     # Create placeholder directory so next_candidate_id increments properly
-    mkdir -p "$ROOT_DIR/candidates/CAND_$CHILD_ID"
+    mkdir -p "$GA_DIR/candidates/CAND_$CHILD_ID"
 done
 
 # Output which candidates need evaluation

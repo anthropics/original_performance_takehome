@@ -3,10 +3,3 @@ trace.json
 **/__pycache__
 .hypothesis
 .DS_Store
-
-# GA optimization artifacts (generated at runtime)
-ga/candidates/CAND_*
-ga/candidates/scores.txt
-ga/candidates/eval_cache.txt
-ga/best/perf_takehome.py
-ga/optimization_progress.txt

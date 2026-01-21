@@ -137,12 +137,12 @@ Parse this output to get:
 
 For each `CROSSOVER: p1 p2 child` line:
 ```
-Task(crossover, "CAND_{p1} CAND_{p2} CAND_{child}")
+Task(crossover, "ga CAND_{p1} CAND_{p2} CAND_{child}")
 ```
 
 The crossover agent will:
-1. Run `./ga/scripts/copy_candidate.sh {p1} {child}` to copy parent1
-2. Read both parents
+1. Run `./scripts/copy_candidate.sh ga {p1} {child}` to copy parent1
+2. Read both parents from `ga/candidates/`
 3. Edit child to incorporate elements from parent2
 4. Test correctness
 
@@ -152,12 +152,12 @@ The crossover agent will:
 
 For each `MUTATE: parent child` line:
 ```
-Task(mutate, "CAND_{parent} CAND_{child}")
+Task(mutate, "ga CAND_{parent} CAND_{child}")
 ```
 
 The mutate agent will:
-1. Run `./ga/scripts/copy_candidate.sh {parent} {child}` to copy parent
-2. Read child file
+1. Run `./scripts/copy_candidate.sh ga {parent} {child}` to copy parent
+2. Read child file from `ga/candidates/`
 3. Make ONE small mutation
 4. Test correctness
 
@@ -203,9 +203,9 @@ Log generation summary and write `=== Generation N COMPLETE ===`
 2. **PARALLEL MUTATIONS**: Launch ALL mutate agents in ONE message
 3. **PARALLEL EVALS**: Run ALL evaluations in ONE message
 4. **NEVER MODIFY PARENTS**: Always create new candidates for offspring
-5. **AGENT ARGS**: Pass ONLY candidate IDs - no hints, no bias
-   - mutate: `CAND_{parent} CAND_{child}`
-   - crossover: `CAND_{parent1} CAND_{parent2} CAND_{child}`
+5. **AGENT ARGS**: Pass base directory and candidate IDs - no hints, no bias
+   - mutate: `ga CAND_{parent} CAND_{child}`
+   - crossover: `ga CAND_{parent1} CAND_{parent2} CAND_{child}`
 
 ## Log Format
 
