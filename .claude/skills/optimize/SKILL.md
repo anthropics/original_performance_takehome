@@ -22,59 +22,158 @@ Log to `optimization_progress.txt` in root directory. This file enables resumpti
 
 ### State Detection on Start
 
-Check these in order:
-
 1. **Read `optimization_progress.txt`** if it exists
 2. **Check for existing candidates** via `ls candidates/`
-3. **Determine resume point** based on log contents:
+3. **Determine resume point**:
    - No log file → fresh start
-   - Log exists with `=== Generation N COMPLETE ===` → resume from generation N+1
-   - Log exists without COMPLETE marker → resume mid-generation (re-evaluate and continue)
-   - Candidates exist but no log → evaluate existing candidates, treat as generation 0 complete
+   - Log has `=== Generation N COMPLETE ===` → resume from generation N+1
+   - Log without COMPLETE marker → re-evaluate and continue
+   - Candidates exist but no log → evaluate existing, treat as generation 0 complete
 
 ## Helper Scripts
 
-- `./scripts/init_candidate.sh {id}` - initialize candidate folder
-- `./scripts/should_crossover.sh {rate}` - exits 0 if should crossover, 1 if not
-- `./scripts/should_mutate.sh {rate}` - exits 0 if should mutate, 1 if not
+All scripts are in `./scripts/`:
+
+### High-Level Scripts (use these)
+
+| Script | Purpose | Output |
+|--------|---------|--------|
+| `init_population.sh {n}` | Initialize N candidates | "Created N candidates" |
+| `plan_generation.sh {gen} {elite} {cr} {mr}` | Plan generation operations | ELITE/CROSSOVER/MUTATE/EVAL lines |
+| `update_score.sh {id} {cycles}` | Update single score | Re-sorts scores.txt |
+| `get_stats.sh [baseline]` | Get population stats | BEST/AVG/IMPROVEMENT lines |
+| `eval_candidate.sh {id}` | Evaluate single candidate | Cycle count |
+| `save_best.sh {id}` | Save best to `best/` | Copies perf_takehome.py |
+
+### Low-Level Scripts (used by high-level scripts)
+
+| Script | Purpose |
+|--------|---------|
+| `init_candidate.sh {id}` | Create single candidate folder |
+| `eval_all.sh` | Evaluate all candidates |
+| `get_elite.sh {n}` | Get top N candidate IDs |
+| `get_non_elite.sh {n}` | Get non-elite IDs |
+| `select_parents.sh {seed}` | Tournament selection |
+| `should_crossover.sh {rate} {seed}` | Decide crossover |
+| `should_mutate.sh {rate} {seed}` | Decide mutation |
+| `parents_identical.sh {p1} {p2}` | Check if parents identical |
 
 ## Workflow
 
-1. **Resume check**:
-   - Read `optimization_progress.txt` if exists
-   - Run `ls candidates/` to check for existing candidates
-   - Determine resume point (see State Detection above)
-   - Log: `[RESUME] Starting from generation N` or `[START] Fresh optimization run`
+### 1. Resume Check
 
-2. **Initialize** (skip if candidates already exist):
-   - Run `./scripts/init_candidate.sh {id}` for candidates 001..N
-   - Log: `[INIT] Created N candidates`
+```bash
+# Check for existing state
+cat optimization_progress.txt 2>/dev/null
+ls candidates/ 2>/dev/null
+```
 
-3. **Evaluate**:
-   - Run `python candidates/{id}/submission_tests.py` to get cycle counts
-   - Log each result: `[EVAL] {id}: XXXX cycles`
+Log: `[RESUME] Starting from generation N` or `[START] Fresh optimization run`
 
-4. **Per generation**:
-   - Rank candidates by cycles (lower = better)
-   - Keep top `elite` unchanged
-   - For each non-elite slot:
-     - Use `./scripts/should_crossover.sh {rate}` to decide crossover vs copy
-     - If crossover: select two parents from top half, create child
-     - Use `./scripts/should_mutate.sh {rate}` to decide mutation
-     - If mutate: apply mutation to candidate
-   - Re-evaluate modified candidates
-   - Write generation summary to log
-   - **CRITICAL**: Write `=== Generation N COMPLETE ===` marker after generation finishes
+### 2. Initialize (skip if candidates exist)
 
-5. **Finish**: Copy best `perf_takehome.py` to root, report improvement
+```bash
+./scripts/init_population.sh 10
+```
+
+Log: `[INIT] Created 10 candidates`
+
+### 3. Generation 0 - Baseline
+
+```bash
+# Evaluate one candidate (all are identical baseline)
+BASELINE=$(./scripts/eval_candidate.sh 001)
+
+# Set all scores to baseline
+for id in 001 002 ... 010; do
+  ./scripts/update_score.sh $id $BASELINE
+done
+
+# Save best
+./scripts/save_best.sh 001
+```
+
+Log baseline and write `=== Generation 0 COMPLETE ===`
+
+### 4. Per Generation Loop
+
+For each generation 1 to N:
+
+#### 4a. Get the Plan
+
+```bash
+./scripts/plan_generation.sh $GEN $ELITE $CROSSOVER_RATE $MUTATION_RATE
+```
+
+Example output:
+```
+ELITE: 001 002 003
+CROSSOVER: 001 002 004
+CROSSOVER: 001 003 005
+MUTATE: 004
+MUTATE: 006
+EVAL: 004 005 006
+```
+
+Parse this output to get:
+- `CROSSOVER` lines → crossover tasks
+- `MUTATE` lines → mutation tasks
+- `EVAL` line → candidates to re-evaluate
+
+#### 4b. Execute Crossovers (PARALLEL)
+
+**CRITICAL: Launch ALL crossover agents in ONE message**
+
+For each `CROSSOVER: p1 p2 child` line:
+```
+Task(crossover, "CAND_{p1} CAND_{p2} CAND_{child}")
+```
+
+#### 4c. Execute Mutations (PARALLEL)
+
+**CRITICAL: Launch ALL mutate agents in ONE message**
+
+For each `MUTATE: id` line:
+```
+Task(mutate, "CAND_{id}")
+```
+
+#### 4d. Re-evaluate Modified Candidates (PARALLEL)
+
+**CRITICAL: Run ALL evaluations in ONE message**
+
+For each id in `EVAL` line:
+```
+Bash("./scripts/eval_candidate.sh {id}")
+```
+
+Then update scores:
+```bash
+./scripts/update_score.sh {id} {cycles}
+```
+
+#### 4e. Update Best & Log
+
+```bash
+./scripts/get_stats.sh $BASELINE
+./scripts/save_best.sh $(./scripts/get_elite.sh 1)
+```
+
+Log generation summary and write `=== Generation N COMPLETE ===`
+
+### 5. Finish
+
+- Best kernel is in `best/perf_takehome.py`
+- Report: initial cycles vs final cycles, improvement percentage
 
 ## Critical Rules
 
-- IMPORTANT: Launch ALL crossover agents in ONE message (parallel Task calls)
-- IMPORTANT: Launch ALL mutate agents in ONE message (parallel Task calls)
-- IMPORTANT: Pass ONLY candidate IDs to agents - no hints, no bias
-  - mutate: `{id}`
-  - crossover: `{parent1} {parent2} {child}`
+1. **PARALLEL CROSSOVERS**: Launch ALL crossover agents in ONE message
+2. **PARALLEL MUTATIONS**: Launch ALL mutate agents in ONE message
+3. **PARALLEL EVALS**: Run ALL evaluations in ONE message
+4. **AGENT ARGS**: Pass ONLY candidate IDs - no hints, no bias
+   - mutate: `CAND_{id}`
+   - crossover: `CAND_{parent1} CAND_{parent2} CAND_{child}`
 
 ## Log Format
 
@@ -83,33 +182,28 @@ Check these in order:
 [INIT] Created 10 candidates
 
 === Generation 0 ===
-Best: XXXX cycles | Avg: XXXX cycles
-
-Candidates:
-  001: XXXX cycles - baseline
-  002: XXXX cycles - baseline
-  ...
+Baseline: 147734 cycles
 === Generation 0 COMPLETE ===
 
 === Generation 1 ===
-[CROSSOVER] 005 = 001 x 002: combined loop unrolling from 001 with register allocation from 002
-[MUTATE] 006: reordered memory accesses
-[EVAL] 005: XXXX cycles
-[EVAL] 006: XXXX cycles
+[PLAN]
+ELITE: 001 002 003
+CROSSOVER: 001 002 004
+MUTATE: 004 006
+EVAL: 004 006
 
-Best: XXXX cycles | Avg: XXXX cycles
+[CROSSOVER] 004: combined VLIW packing with memory layout
+[MUTATE] 004: reordered memory accesses
+[MUTATE] 006: unrolled inner loop
+[EVAL] 004: 142000 cycles
+[EVAL] 006: 148000 cycles
 
-Candidates:
-  001: XXXX cycles - elite (unchanged)
-  002: XXXX cycles - elite (unchanged)
-  005: XXXX cycles - crossover of 001 x 002
-  006: XXXX cycles - mutated
-  ...
+BEST: 004 142000
+AVG: 145234
+IMPROVEMENT: 3.9%
 === Generation 1 COMPLETE ===
 ```
 
 **Key markers for resumption:**
-- `=== Generation N COMPLETE ===` - signals generation fully finished (parse to find last complete)
-- `[EVAL] {id}:` - individual evaluations (allows mid-generation recovery)
-
-Record the one-line summary returned by each agent (mutation or crossover description).
+- `=== Generation N COMPLETE ===` - generation fully finished
+- `[EVAL] {id}:` - individual evaluations (mid-generation recovery)
