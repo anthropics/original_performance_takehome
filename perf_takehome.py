@@ -210,7 +210,7 @@ class KernelBuilder:
         body = []  # array of slots
 
         # Fibonacci unrolling with separate temporaries per iteration
-        UNROLL_FACTOR = 8  # Fibonacci number for aperiodic ILP exposure
+        UNROLL_FACTOR = 16  # Optimal unroll factor for this architecture
         
         # Allocate independent register sets for each unrolled iteration
         unroll_regs = []
@@ -267,11 +267,30 @@ class KernelBuilder:
                     reg = unroll_regs[u]
                     body.append(("alu", ("^", reg['val'], reg['val'], reg['node_val'])))
                 
-                # Stage 5: Hash operations (phason-optimized)
+                # Stage 5: Hash operations (interleaved across iterations for ILP)
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    val1_const = self.scratch_const(val1)
+                    val3_const = self.scratch_const(val3)
+                    # All op1 operations for this stage across all iterations
+                    for u in range(effective_unroll):
+                        i = i_base + u
+                        reg = unroll_regs[u]
+                        body.append(("alu", (op1, reg['tmp1'], reg['val'], val1_const)))
+                    # All op3 operations for this stage across all iterations
+                    for u in range(effective_unroll):
+                        i = i_base + u
+                        reg = unroll_regs[u]
+                        body.append(("alu", (op3, reg['tmp2'], reg['val'], val3_const)))
+                    # All op2 operations for this stage across all iterations
+                    for u in range(effective_unroll):
+                        i = i_base + u
+                        reg = unroll_regs[u]
+                        body.append(("alu", (op2, reg['val'], reg['tmp1'], reg['tmp2'])))
+                        body.append(("debug", ("compare", reg['val'], (round, i, "hash_stage", hi))))
+                # Final hash_val debug compares
                 for u in range(effective_unroll):
                     i = i_base + u
                     reg = unroll_regs[u]
-                    body.extend(self.build_hash(reg['val'], reg['tmp1'], reg['tmp2'], round, i))
                     body.append(("debug", ("compare", reg['val'], (round, i, "hashed_val"))))
                 
                 # Stage 6: Index update arithmetic (parallel where possible)
@@ -305,20 +324,23 @@ class KernelBuilder:
                     body.append(("alu", ("*", reg['idx'], reg['tmp1'], reg['idx'])))
                     body.append(("debug", ("compare", reg['idx'], (round, i, "wrapped_idx"))))
                 
-                # Stage 10: Store results (use separate addr2 registers for stores)
+                # Stage 10: Store results - compute all addresses first, then store
+                # Address calculations for idx stores
                 for u in range(effective_unroll):
                     i = i_base + u
                     i_const = self.scratch_const(i)
                     reg = unroll_regs[u]
-                    # Store indices
-                    body.append(("alu", ("+", reg['addr2'], self.scratch["inp_indices_p"], i_const)))
-                    body.append(("store", ("store", reg['addr2'], reg['idx'])))
+                    body.append(("alu", ("+", reg['addr'], self.scratch["inp_indices_p"], i_const)))
+                # Address calculations for val stores
                 for u in range(effective_unroll):
                     i = i_base + u
                     i_const = self.scratch_const(i)
                     reg = unroll_regs[u]
-                    # Store values
                     body.append(("alu", ("+", reg['addr2'], self.scratch["inp_values_p"], i_const)))
+                # All stores together (interleave idx and val to hit 2 stores per cycle)
+                for u in range(effective_unroll):
+                    reg = unroll_regs[u]
+                    body.append(("store", ("store", reg['addr'], reg['idx'])))
                     body.append(("store", ("store", reg['addr2'], reg['val'])))
 
         body_instrs = self.build(body, vliw=True)
