@@ -451,25 +451,28 @@ class KernelBuilder:
         # Pre-allocate base addresses
         base_addrs = [self.scratch_const(g * VLEN) for g in range(n_groups)]
 
-        for round in range(rounds):
-            # Process in batches of PARALLEL_GROUPS
-            for batch_start in range(0, n_groups, PARALLEL_GROUPS):
-                batch_end = min(batch_start + PARALLEL_GROUPS, n_groups)
-                batch_size_actual = batch_end - batch_start
+        # REGISTER REUSE OPTIMIZATION (Phase 17-21, fib:34)
+        # Process each group across ALL rounds, keeping data in registers
+        # This eliminates 15/16 of load/store operations!
+        for batch_start in range(0, n_groups, PARALLEL_GROUPS):
+            batch_end = min(batch_start + PARALLEL_GROUPS, n_groups)
+            batch_size_actual = batch_end - batch_start
 
-                # PHASE 1: Load ALL indices and values in parallel
-                for bg in range(batch_size_actual):
-                    g = batch_start + bg
-                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_indices_p"], g * VLEN)])
-                for bg in range(batch_size_actual):
-                    self.emit(load=[("vload", v_idx[bg], tmp_addr[bg])])
+            # ========== LOAD ONCE AT START ==========
+            for bg in range(batch_size_actual):
+                g = batch_start + bg
+                self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_indices_p"], g * VLEN)])
+            for bg in range(batch_size_actual):
+                self.emit(load=[("vload", v_idx[bg], tmp_addr[bg])])
 
-                for bg in range(batch_size_actual):
-                    g = batch_start + bg
-                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_values_p"], g * VLEN)])
-                for bg in range(batch_size_actual):
-                    self.emit(load=[("vload", v_val[bg], tmp_addr[bg])])
+            for bg in range(batch_size_actual):
+                g = batch_start + bg
+                self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_values_p"], g * VLEN)])
+            for bg in range(batch_size_actual):
+                self.emit(load=[("vload", v_val[bg], tmp_addr[bg])])
 
+            # ========== PROCESS ALL ROUNDS (data stays in registers) ==========
+            for round in range(rounds):
                 # Debug
                 for bg in range(batch_size_actual):
                     g = batch_start + bg
@@ -559,18 +562,18 @@ class KernelBuilder:
                         i = g * VLEN + vi
                         self.emit(debug=[("compare", v_idx[bg] + vi, (round, i, "wrapped_idx"))])
 
-                # PHASE 7: Store ALL results in parallel
-                for bg in range(batch_size_actual):
-                    g = batch_start + bg
-                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_indices_p"], g * VLEN)])
-                for bg in range(batch_size_actual):
-                    self.emit(store=[("vstore", tmp_addr[bg], v_idx[bg])])
+            # ========== STORE ONCE AT END (after all rounds) ==========
+            for bg in range(batch_size_actual):
+                g = batch_start + bg
+                self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_indices_p"], g * VLEN)])
+            for bg in range(batch_size_actual):
+                self.emit(store=[("vstore", tmp_addr[bg], v_idx[bg])])
 
-                for bg in range(batch_size_actual):
-                    g = batch_start + bg
-                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_values_p"], g * VLEN)])
-                for bg in range(batch_size_actual):
-                    self.emit(store=[("vstore", tmp_addr[bg], v_val[bg])])
+            for bg in range(batch_size_actual):
+                g = batch_start + bg
+                self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_values_p"], g * VLEN)])
+            for bg in range(batch_size_actual):
+                self.emit(store=[("vstore", tmp_addr[bg], v_val[bg])])
 
         self.instrs.append({"flow": [("pause",)]})
 
