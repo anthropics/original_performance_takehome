@@ -71,6 +71,19 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def broadcast_const(self, val, name=None):
+        """Allocate a vector constant by broadcasting a scalar value to VLEN elements."""
+        key = ("vec", val)
+        if key not in self.const_map:
+            # First get scalar constant
+            scalar_addr = self.scratch_const(val)
+            # Allocate vector space
+            vec_addr = self.alloc_scratch(name or f"v_const_{val}", length=VLEN)
+            # Broadcast scalar to vector
+            self.add("valu", ("vbroadcast", vec_addr, scalar_addr))
+            self.const_map[key] = vec_addr
+        return self.const_map[key]
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -80,6 +93,21 @@ class KernelBuilder:
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
+        return slots
+
+    def build_hash_vectorized(self, v_val, v_tmp1, v_tmp2):
+        """Vectorized hash computation - operates on VLEN elements at once."""
+        slots = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            # Get or create broadcasted vector constants
+            v_const1 = self.broadcast_const(val1)
+            v_const3 = self.broadcast_const(val3)
+            # v_tmp1 = v_val op1 const1
+            slots.append(("valu", (op1, v_tmp1, v_val, v_const1)))
+            # v_tmp2 = v_val op3 const3
+            slots.append(("valu", (op3, v_tmp2, v_val, v_const3)))
+            # v_val = v_tmp1 op2 v_tmp2
+            slots.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
         return slots
 
     def build_kernel(
@@ -170,6 +198,111 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+    def build_kernel_vectorized(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        """
+        Vectorized kernel - processes VLEN (8) batch elements at a time.
+        """
+        # Scalar temporaries
+        tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_scalar = self.alloc_scratch("tmp_scalar")
+
+        # Vector scratch registers (each is VLEN=8 words)
+        v_idx = self.alloc_scratch("v_idx", VLEN)
+        v_val = self.alloc_scratch("v_val", VLEN)
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+
+        # Load header values from memory
+        init_vars = [
+            "rounds",
+            "n_nodes",
+            "batch_size",
+            "forest_height",
+            "forest_values_p",
+            "inp_indices_p",
+            "inp_values_p",
+        ]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        for i, v in enumerate(init_vars):
+            self.add("load", ("const", tmp_addr, i))
+            self.add("load", ("load", self.scratch[v], tmp_addr))
+
+        # Scalar constants
+        zero_const = self.scratch_const(0)
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+
+        # Vector constants (broadcasted)
+        v_zero = self.broadcast_const(0, "v_zero")
+        v_one = self.broadcast_const(1, "v_one")
+        v_two = self.broadcast_const(2, "v_two")
+        v_n_nodes = self.broadcast_const(n_nodes, "v_n_nodes")
+
+        # Pause to match reference_kernel2's first yield
+        self.add("flow", ("pause",))
+        self.add("debug", ("comment", "Starting vectorized loop"))
+
+        body = []
+
+        for round in range(rounds):
+            for i in range(0, batch_size, VLEN):  # Step by 8
+                batch_offset = self.scratch_const(i)
+
+                # Load 8 indices: v_idx = mem[inp_indices_p + i : inp_indices_p + i + 8]
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_offset)))
+                body.append(("load", ("vload", v_idx, tmp_addr)))
+
+                # Load 8 values: v_val = mem[inp_values_p + i : inp_values_p + i + 8]
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_offset)))
+                body.append(("load", ("vload", v_val, tmp_addr)))
+
+                # Gather 8 tree values (this is the bottleneck - non-contiguous access)
+                # v_node_val[j] = mem[forest_values_p + v_idx[j]] for j in 0..7
+                for j in range(VLEN):
+                    body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], v_idx + j)))
+                    body.append(("load", ("load", v_node_val + j, tmp_addr)))
+
+                # XOR values with node values: v_val = v_val ^ v_node_val
+                body.append(("valu", ("^", v_val, v_val, v_node_val)))
+
+                # Vectorized hash computation (18 valu operations)
+                body.extend(self.build_hash_vectorized(v_val, v_tmp1, v_tmp2))
+
+                # Compute next index: idx = 2*idx + (1 if val%2==0 else 2)
+                # v_tmp1 = v_val & 1 (faster than %)
+                body.append(("valu", ("&", v_tmp1, v_val, v_one)))
+                # v_tmp1 = (v_tmp1 == 0) ? 1 : 0
+                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
+                # v_tmp3 = v_tmp1 ? 1 : 2 (if even, add 1; if odd, add 2)
+                body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
+                # v_idx = 2 * v_idx
+                body.append(("valu", ("*", v_idx, v_idx, v_two)))
+                # v_idx = v_idx + v_tmp3
+                body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+
+                # Wrap index: idx = 0 if idx >= n_nodes else idx
+                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
+                body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+
+                # Store 8 indices: mem[inp_indices_p + i : ...] = v_idx
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_offset)))
+                body.append(("store", ("vstore", tmp_addr, v_idx)))
+
+                # Store 8 values: mem[inp_values_p + i : ...] = v_val
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_offset)))
+                body.append(("store", ("vstore", tmp_addr, v_val)))
+
+        body_instrs = self.build(body)
+        self.instrs.extend(body_instrs)
+        # Required to match with the yield in reference_kernel2
+        self.instrs.append({"flow": [("pause",)]})
+
+
 BASELINE = 147734
 
 def do_kernel_test(
@@ -187,7 +320,7 @@ def do_kernel_test(
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    kb.build_kernel_vectorized(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
     value_trace = {}
