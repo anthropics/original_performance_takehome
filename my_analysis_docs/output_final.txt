@@ -1,0 +1,26 @@
+E
+======================================================================
+ERROR: test_kernel_cycles (__main__.Tests.test_kernel_cycles)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\perf_takehome.py", line 403, in test_kernel_cycles
+    do_kernel_test(10, 16, 256, trace=False, prints=False)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\perf_takehome.py", line 341, in do_kernel_test
+    machine.run()
+    ~~~~~~~~~~~^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 213, in run
+    self.step(instr, core)
+    ~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 396, in step
+    core.scratch[addr] = val
+    ~~~~~~~~~~~~^^^^^^
+IndexError: list assignment index out of range
+
+----------------------------------------------------------------------
+Ran 1 test in 0.074s
+
+FAILED (errors=1)
+forest_height=10, rounds=16, batch_size=256
+DEBUG: print_reg n_nodes_vec_debug@1056 = 2047
+CRASH: IndexError writing to scratch[1536]. val=7. Inst={'alu': [('+', 1530, 1053, 72), ('+', 1531, 1053, 73), ('+', 1532, 1053, 74), ('+', 1533, 1053, 75), ('+', 1534, 1053, 76), ('+', 1535, 1053, 77), ('+', 1536, 1053, 78), ('+', 1537, 1053, 79), ('+', 1562, 1053, 80), ('+', 1563, 1053, 81), ('+', 1564, 1053, 82), ('+', 1565, 1053, 83)], 'load': [('load', 1268, 1276), ('load', 1269, 1277)], 'valu': [('+', 1250, 256, 1127)]}

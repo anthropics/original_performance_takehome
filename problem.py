@@ -392,6 +392,8 @@ class Machine:
                     self.trace_slot(core, slot, name, i)
                 ENGINE_FNS[name](core, *slot)
         for addr, val in self.scratch_write.items():
+            if addr < 0 or addr >= len(core.scratch):
+                print(f"CRASH: Trying to access scratch[{addr}], scratchsize={len(core.scratch)}. val={val}. Inst={instr}")
             core.scratch[addr] = val
         for addr, val in self.mem_write.items():
             self.mem[addr] = val

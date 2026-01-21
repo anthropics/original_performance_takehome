@@ -1,0 +1,35 @@
+Tasks
+ Read 
+Readme.md
+ to understand the assignment
+ Analyze 
+problem.py
+ and 
+perf_takehome.py
+ to understand the code logic and bottlenecks
+ Analyze tests to understand correctness requirements
+ Use context7 to research relevant optimization techniques or libraries if applicable
+ Create an Architecture Diagram (Mermaid)
+ Formulate a practical, expandable implementation plan
+ Present the full analysis to the user
+ Implement Vectorized Kernel
+ Skeleton 
+OptimizedKernelBuilder
+ 
+SmartScheduler
+ for pipelining
+ 
+gen_batch
+ for instruction generation
+ Debugging and Verification
+ Fix IndexError (scratch_ptr init)
+ Fix ZeroDivisionError (n_nodes_vec broadcast)
+ Fix Incorrect Result (Test harness issue)
+ Fix Memory Overflow (t_base calculation)
+Achieve <1,790 Cycles Target
+ Deep meta-analysis of performance bottlenecks
+ Fix t_base to reuse temp memory between waves
+ Remove debug overhead
+Verify correctness with batch_size=256
+ Confirm cycle count <1,790
+ Run submission tests

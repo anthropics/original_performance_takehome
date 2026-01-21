@@ -1,0 +1,30 @@
+E
+======================================================================
+ERROR: test_kernel_cycles (__main__.Tests.test_kernel_cycles)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\perf_takehome.py", line 407, in test_kernel_cycles
+    do_kernel_test(10, 16, 256, trace=False, prints=False)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\perf_takehome.py", line 345, in do_kernel_test
+    machine.run()
+    ~~~~~~~~~~~^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 213, in run
+    self.step(instr, core)
+    ~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 393, in step
+    ENGINE_FNS[name](core, *slot)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 265, in valu
+    self.alu(core, op, dest + i, a1 + i, a2 + i)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\HarshKumar\Downloads\harsh-original_performance_takehome\problem.py", line 244, in alu
+    res = a1 % a2
+          ~~~^~~~
+ZeroDivisionError: division by zero
+
+----------------------------------------------------------------------
+Ran 1 test in 0.033s
+
+FAILED (errors=1)
+forest_height=10, rounds=16, batch_size=256

@@ -139,10 +139,12 @@ class OptimizedKernelBuilder:
         
         self.instrs.extend(prologue_instrs)
 
+        # Allocate shared constants in CACHE_BASE to save TMP_BASE for batch temps
+        self.scratch_ptr = self.CACHE_BASE
+        
         # Broadcast n_nodes immediately
         N_NODES_VEC = self.alloc_scratch("n_nodes_vec", VLEN)
         self.instrs.append({"valu": [("vbroadcast", N_NODES_VEC, n_nodes_addr)]})
-        self.instrs.append({"debug": [("print_reg", N_NODES_VEC, "n_nodes_vec_debug")]})
         
         # Load Indices and Values loops
         load_loop = []
@@ -165,7 +167,9 @@ class OptimizedKernelBuilder:
              self.instrs.append({"valu": [("vbroadcast", c1, s1), ("vbroadcast", c3, s3)]})
              HASH_CONSTS_VECS.append((c1, c3))
              
-
+        # Reset scratch_ptr to TMP_BASE for batch temporary allocations
+        # This keeps hash constants in CACHE_BASE (512-~620) and batch temps in TMP_BASE (1024-1535)
+        self.scratch_ptr = self.TMP_BASE
 
         # Smart Scheduler for Main Loop
         scheduler = SmartScheduler(SLOT_LIMITS)
@@ -210,7 +214,7 @@ class OptimizedKernelBuilder:
                     forest_values_p_addr, 
 
                     TWO_VEC, ZERO_VEC, ONE_VEC, N_NODES_VEC,
-                    THREAD_MEM_START + (((wave_start // VLEN) + b_idx) * 32)
+                    THREAD_MEM_START + (b_idx * 32)
                 )
                 wave_generators.append((b_idx, gen))
                 
