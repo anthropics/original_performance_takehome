@@ -195,7 +195,7 @@ class KernelBuilder:
     ):
         """
         Vectorized kernel with aggressive unrolling for maximum VLIW packing.
-        Process multiple VLEN=8 vectors at once to maximize ILP.
+        Process multiple VLEN vectors at once to maximize ILP.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
