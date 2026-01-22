@@ -180,6 +180,22 @@ python tests/submission_tests.py
 4. **Forgetting slot limits**: Can't exceed SLOT_LIMITS per cycle
 5. **Data dependencies**: Effects don't apply until cycle end
 
+## Git and PR Configuration
+
+**IMPORTANT**: This is a fork. All PRs must target this repository (`chris-go/anthropic_original_performance_takehome`), NOT the original `anthropics` repo.
+
+- Remote `origin` points to: `chris-go/anthropic_original_performance_takehome`
+- No upstream remote should exist
+- When creating PRs, always verify the target repository
+
+```bash
+# Verify remote configuration (should only show chris-go repo)
+git remote -v
+
+# If an upstream remote exists pointing to anthropics, remove it:
+git remote remove upstream
+```
+
 ## Quick Reference
 
 ```python
