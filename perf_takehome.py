@@ -920,6 +920,172 @@ class KernelBuilder:
                                 }
                             )
 
+                    loads = []
+                    for _ in range(2):
+                        if has_next and prefetch_idx < VLEN * next_count:
+                            bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                            if bi < next_count:
+                                loads.append(
+                                    (
+                                        "load_offset",
+                                        v_node_next[bi],
+                                        v_addr_next[bi],
+                                        ei,
+                                    )
+                                )
+                                prefetch_idx += 1
+                    self.emit(
+                        {
+                            "valu": [
+                                ("&", v_tmp1[i], v_val[i], v_one) for i in range(BATCH)
+                            ],
+                            **({"load": loads} if loads else {}),
+                        }
+                    )
+                    loads = []
+                    for _ in range(2):
+                        if has_next and prefetch_idx < VLEN * next_count:
+                            bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                            if bi < next_count:
+                                loads.append(
+                                    (
+                                        "load_offset",
+                                        v_node_next[bi],
+                                        v_addr_next[bi],
+                                        ei,
+                                    )
+                                )
+                                prefetch_idx += 1
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", v_tmp2[i], v_one, v_tmp1[i]) for i in range(BATCH)
+                            ],
+                            **({"load": loads} if loads else {}),
+                        }
+                    )
+                    loads = []
+                    for _ in range(2):
+                        if has_next and prefetch_idx < VLEN * next_count:
+                            bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                            if bi < next_count:
+                                loads.append(
+                                    (
+                                        "load_offset",
+                                        v_node_next[bi],
+                                        v_addr_next[bi],
+                                        ei,
+                                    )
+                                )
+                                prefetch_idx += 1
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_idx[i],
+                                    s_idx + offs[i],
+                                    v_two,
+                                    v_tmp2[i],
+                                )
+                                for i in range(BATCH)
+                            ],
+                            **({"load": loads} if loads else {}),
+                        }
+                    )
+                    loads = []
+                    for _ in range(2):
+                        if has_next and prefetch_idx < VLEN * next_count:
+                            bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                            if bi < next_count:
+                                loads.append(
+                                    (
+                                        "load_offset",
+                                        v_node_next[bi],
+                                        v_addr_next[bi],
+                                        ei,
+                                    )
+                                )
+                                prefetch_idx += 1
+                    self.emit(
+                        {
+                            "valu": [
+                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
+                                for i in range(BATCH)
+                            ],
+                            **({"load": loads} if loads else {}),
+                        }
+                    )
+                    loads = []
+                    for _ in range(2):
+                        if has_next and prefetch_idx < VLEN * next_count:
+                            bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                            if bi < next_count:
+                                loads.append(
+                                    (
+                                        "load_offset",
+                                        v_node_next[bi],
+                                        v_addr_next[bi],
+                                        ei,
+                                    )
+                                )
+                                prefetch_idx += 1
+                    self.emit(
+                        {
+                            "valu": [
+                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
+                                for i in range(BATCH)
+                            ],
+                            **({"load": loads} if loads else {}),
+                        }
+                    )
+                    loads = []
+                    for _ in range(2):
+                        if has_next and prefetch_idx < VLEN * next_count:
+                            bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                            if bi < next_count:
+                                loads.append(
+                                    (
+                                        "load_offset",
+                                        v_node_next[bi],
+                                        v_addr_next[bi],
+                                        ei,
+                                    )
+                                )
+                                prefetch_idx += 1
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_idx + offs[i], v_idx[i], v_zero)
+                                for i in range(BATCH)
+                            ],
+                            **({"load": loads} if loads else {}),
+                        }
+                    )
+                    loads = []
+                    for _ in range(2):
+                        if has_next and prefetch_idx < VLEN * next_count:
+                            bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                            if bi < next_count:
+                                loads.append(
+                                    (
+                                        "load_offset",
+                                        v_node_next[bi],
+                                        v_addr_next[bi],
+                                        ei,
+                                    )
+                                )
+                                prefetch_idx += 1
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_val + offs[i], v_val[i], v_zero)
+                                for i in range(BATCH)
+                            ],
+                            **({"load": loads} if loads else {}),
+                        }
+                    )
+
                     while has_next and prefetch_idx < VLEN * next_count:
                         loads = []
                         for _ in range(2):
@@ -937,67 +1103,6 @@ class KernelBuilder:
                                     prefetch_idx += 1
                         if loads:
                             self.emit({"load": loads})
-
-                    self.emit(
-                        {
-                            "valu": [
-                                ("&", v_tmp1[i], v_val[i], v_one) for i in range(BATCH)
-                            ]
-                        }
-                    )
-                    self.emit(
-                        {
-                            "valu": [
-                                ("+", v_tmp2[i], v_one, v_tmp1[i]) for i in range(BATCH)
-                            ]
-                        }
-                    )
-                    self.emit(
-                        {
-                            "valu": [
-                                (
-                                    "multiply_add",
-                                    v_idx[i],
-                                    s_idx + offs[i],
-                                    v_two,
-                                    v_tmp2[i],
-                                )
-                                for i in range(BATCH)
-                            ]
-                        }
-                    )
-                    self.emit(
-                        {
-                            "valu": [
-                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
-                                for i in range(BATCH)
-                            ]
-                        }
-                    )
-                    self.emit(
-                        {
-                            "valu": [
-                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
-                                for i in range(BATCH)
-                            ]
-                        }
-                    )
-                    self.emit(
-                        {
-                            "valu": [
-                                ("+", s_idx + offs[i], v_idx[i], v_zero)
-                                for i in range(BATCH)
-                            ]
-                        }
-                    )
-                    self.emit(
-                        {
-                            "valu": [
-                                ("+", s_val + offs[i], v_val[i], v_zero)
-                                for i in range(BATCH)
-                            ]
-                        }
-                    )
 
                     if has_next:
                         v_node, v_node_next = v_node_next, v_node
