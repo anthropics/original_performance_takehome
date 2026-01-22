@@ -204,18 +204,20 @@ class KernelBuilder:
             idx_A, val_A = v_idx[b], v_val[b]
             idx_B, val_B = v_idx[b + 1], v_val[b + 1]
 
-            # Cycle 1: A addr compute (8 ALU)
+            # Cycle 1: A addr compute (8 ALU) + B addr 0-3 (4 ALU) = 12 ALU
             self.add_bundle({"alu": [
                 ("+", addr_A[i], self.scratch["forest_values_p"], idx_A + i) for i in range(VLEN)
-            ]})
+            ] + [("+", addr_B[j], self.scratch["forest_values_p"], idx_B + j) for j in range(4)]
+            })
 
-            # Cycle 2: B addr compute (8 ALU)
-            self.add_bundle({"alu": [
-                ("+", addr_B[i], self.scratch["forest_values_p"], idx_B + i) for i in range(VLEN)
-            ]})
+            # Cycle 2: A gather 0-1 + B addr 4-7 (4 ALU)
+            self.add_bundle({
+                "load": [("load", v_node_A + 0, addr_A[0]), ("load", v_node_A + 1, addr_A[1])],
+                "alu": [("+", addr_B[j], self.scratch["forest_values_p"], idx_B + j) for j in range(4, VLEN)],
+            })
 
-            # Cycles 3-6: A gather
-            for i in range(0, VLEN, 2):
+            # Cycles 3-5: A gather 2-7 (3 cycles instead of 4, since we did 0-1 already)
+            for i in range(2, VLEN, 2):
                 self.add_bundle({"load": [
                     ("load", v_node_A + i, addr_A[i]),
                     ("load", v_node_A + i + 1, addr_A[i + 1]),
@@ -306,11 +308,20 @@ class KernelBuilder:
                 "flow": [("vselect", idx_A, v_tmp1_A, idx_A, v_zero)],
             })
 
-            # B idx continues
+            # B idx computation - try to overlap with next pair's setup
             self.add_bundle({"valu": [("+", v_tmp1_B, v_tmp1_B, v_one)]})
             self.add_bundle({"valu": [("+", idx_B, idx_B, v_tmp1_B)]})
             self.add_bundle({"valu": [("<", v_tmp1_B, idx_B, v_n_nodes)]})
-            self.add_bundle({"flow": [("vselect", idx_B, v_tmp1_B, idx_B, v_zero)]})
+
+            # If not last pair, start next pair's address computation while doing B vselect
+            if b + 2 < num_batches:
+                next_idx_A = v_idx[b + 2]
+                self.add_bundle({
+                    "alu": [("+", addr_A[i], self.scratch["forest_values_p"], next_idx_A + i) for i in range(VLEN)],
+                    "flow": [("vselect", idx_B, v_tmp1_B, idx_B, v_zero)],
+                })
+            else:
+                self.add_bundle({"flow": [("vselect", idx_B, v_tmp1_B, idx_B, v_zero)]})
 
         # Round loop control
         self.add_bundle({"flow": [("add_imm", round_counter, round_counter, 1)]})
