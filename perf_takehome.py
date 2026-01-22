@@ -117,10 +117,8 @@ class KernelBuilder:
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1 = self.alloc_scratch(f"hc1_{hi}", VLEN)
             c3 = self.alloc_scratch(f"hc3_{hi}", VLEN)
-            self.add("load", ("const", tmp1, val1))
-            self.emit({"valu": [("vbroadcast", c1, tmp1)]})
-            self.add("load", ("const", tmp1, val3))
-            self.emit({"valu": [("vbroadcast", c3, tmp1)]})
+            self.emit({"load": [("const", tmp1, val1), ("const", tmp2, val3)]})
+            self.emit({"valu": [("vbroadcast", c1, tmp1), ("vbroadcast", c3, tmp2)]})
             hash_consts.append((c1, c3))
 
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -129,12 +127,16 @@ class KernelBuilder:
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
 
-        self.emit({"valu": [("vbroadcast", v_zero, zero_const)]})
-        self.emit({"valu": [("vbroadcast", v_one, one_const)]})
-        self.emit({"valu": [("vbroadcast", v_two, two_const)]})
-        self.emit({"valu": [("vbroadcast", v_n_nodes, self.scratch["n_nodes"])]})
         self.emit(
-            {"valu": [("vbroadcast", v_forest_p, self.scratch["forest_values_p"])]}
+            {
+                "valu": [
+                    ("vbroadcast", v_zero, zero_const),
+                    ("vbroadcast", v_one, one_const),
+                    ("vbroadcast", v_two, two_const),
+                    ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+                    ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
+                ]
+            }
         )
 
         n_vectors = batch_size // VLEN
@@ -293,47 +295,90 @@ class KernelBuilder:
                         }
                     )
 
-                for i in range(remainder_bc):
-                    off = (n_triples_bc * 3 + i) * VLEN
+                if remainder_bc > 0:
+                    offs_bc = [
+                        (n_triples_bc * 3 + i) * VLEN for i in range(remainder_bc)
+                    ]
                     self.emit(
-                        {"valu": [("^", v_val[0], s_val + off, v_broadcast_node)]}
+                        {
+                            "valu": [
+                                ("^", v_val[i], s_val + offs_bc[i], v_broadcast_node)
+                                for i in range(remainder_bc)
+                            ]
+                        }
                     )
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                         c1, c3 = hash_consts[hi]
+                        ops1 = [
+                            (op1, v_tmp1[i], v_val[i], c1) for i in range(remainder_bc)
+                        ]
+                        ops1 += [
+                            (op3, v_tmp2[i], v_val[i], c3) for i in range(remainder_bc)
+                        ]
+                        self.emit({"valu": ops1})
                         self.emit(
                             {
                                 "valu": [
-                                    (op1, v_tmp1[0], v_val[0], c1),
-                                    (op3, v_tmp2[0], v_val[0], c3),
+                                    (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                    for i in range(remainder_bc)
                                 ]
                             }
                         )
-                        self.emit({"valu": [(op2, v_val[0], v_tmp1[0], v_tmp2[0])]})
-                    self.emit({"valu": [("&", v_tmp1[0], v_val[0], v_one)]})
-                    self.emit({"valu": [("+", v_tmp2[0], v_one, v_tmp1[0])]})
+                    self.emit(
+                        {
+                            "valu": [
+                                ("&", v_tmp1[i], v_val[i], v_one)
+                                for i in range(remainder_bc)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", v_tmp2[i], v_one, v_tmp1[i])
+                                for i in range(remainder_bc)
+                            ]
+                        }
+                    )
                     self.emit(
                         {
                             "valu": [
                                 (
                                     "multiply_add",
-                                    v_idx[0],
-                                    s_idx + off,
+                                    v_idx[i],
+                                    s_idx + offs_bc[i],
                                     v_two,
-                                    v_tmp2[0],
+                                    v_tmp2[i],
                                 )
+                                for i in range(remainder_bc)
                             ]
                         }
                     )
-                    self.emit({"valu": [("<", v_tmp1[0], v_idx[0], v_n_nodes)]})
-                    self.emit({"valu": [("*", v_idx[0], v_idx[0], v_tmp1[0])]})
                     self.emit(
                         {
                             "valu": [
-                                ("+", s_idx + off, v_idx[0], v_zero),
-                                ("+", s_val + off, v_val[0], v_zero),
+                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
+                                for i in range(remainder_bc)
                             ]
                         }
                     )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
+                                for i in range(remainder_bc)
+                            ]
+                        }
+                    )
+                    wb_bc = [
+                        ("+", s_idx + offs_bc[i], v_idx[i], v_zero)
+                        for i in range(remainder_bc)
+                    ]
+                    wb_bc += [
+                        ("+", s_val + offs_bc[i], v_val[i], v_zero)
+                        for i in range(remainder_bc)
+                    ]
+                    self.emit({"valu": wb_bc})
             else:
                 n_triples = n_vectors // 3
                 remainder = n_vectors % 3
@@ -371,33 +416,45 @@ class KernelBuilder:
                                     ]
                                 }
                             )
-                        for i in range(VLEN):
-                            self.emit(
-                                {"load": [("load_offset", v_node[2], v_addr[2], i)]}
-                            )
-
-                    self.emit(
-                        {
-                            "valu": [
-                                ("^", v_val[0], s_val + offs[0], v_node[0]),
-                                ("^", v_val[1], s_val + offs[1], v_node[1]),
-                                ("^", v_val[2], s_val + offs[2], v_node[2]),
-                            ]
-                        }
-                    )
+                        for i in range(0, VLEN, 2):
+                            if i + 1 < VLEN:
+                                self.emit(
+                                    {
+                                        "load": [
+                                            ("load_offset", v_node[2], v_addr[2], i),
+                                            (
+                                                "load_offset",
+                                                v_node[2],
+                                                v_addr[2],
+                                                i + 1,
+                                            ),
+                                        ]
+                                    }
+                                )
+                            else:
+                                self.emit(
+                                    {"load": [("load_offset", v_node[2], v_addr[2], i)]}
+                                )
 
                     if has_next:
                         next_count = 3 if triple < n_triples - 1 else remainder
+                        xor_ops = [
+                            ("^", v_val[0], s_val + offs[0], v_node[0]),
+                            ("^", v_val[1], s_val + offs[1], v_node[1]),
+                            ("^", v_val[2], s_val + offs[2], v_node[2]),
+                        ]
+                        addr_ops = [
+                            ("+", v_addr_next[i], v_forest_p, s_idx + next_offs[i])
+                            for i in range(next_count)
+                        ]
+                        self.emit({"valu": xor_ops + addr_ops})
+                    else:
                         self.emit(
                             {
                                 "valu": [
-                                    (
-                                        "+",
-                                        v_addr_next[i],
-                                        v_forest_p,
-                                        s_idx + next_offs[i],
-                                    )
-                                    for i in range(next_count)
+                                    ("^", v_val[0], s_val + offs[0], v_node[0]),
+                                    ("^", v_val[1], s_val + offs[1], v_node[1]),
+                                    ("^", v_val[2], s_val + offs[2], v_node[2]),
                                 ]
                             }
                         )
@@ -564,24 +621,52 @@ class KernelBuilder:
                 if remainder > 0:
                     offs = [(n_triples * 3 + i) * VLEN for i in range(remainder)]
                     if n_triples == 0:
-                        for i in range(remainder):
-                            self.emit(
-                                {
-                                    "valu": [
-                                        ("+", v_addr[i], v_forest_p, s_idx + offs[i])
-                                    ]
-                                }
-                            )
-                        for b in range(remainder):
-                            for i in range(VLEN):
-                                self.emit(
-                                    {"load": [("load_offset", v_node[b], v_addr[b], i)]}
-                                )
-
-                    for i in range(remainder):
                         self.emit(
-                            {"valu": [("^", v_val[i], s_val + offs[i], v_node[i])]}
+                            {
+                                "valu": [
+                                    ("+", v_addr[i], v_forest_p, s_idx + offs[i])
+                                    for i in range(remainder)
+                                ]
+                            }
                         )
+                        for b in range(remainder):
+                            for i in range(0, VLEN, 2):
+                                if i + 1 < VLEN:
+                                    self.emit(
+                                        {
+                                            "load": [
+                                                (
+                                                    "load_offset",
+                                                    v_node[b],
+                                                    v_addr[b],
+                                                    i,
+                                                ),
+                                                (
+                                                    "load_offset",
+                                                    v_node[b],
+                                                    v_addr[b],
+                                                    i + 1,
+                                                ),
+                                            ]
+                                        }
+                                    )
+                                else:
+                                    self.emit(
+                                        {
+                                            "load": [
+                                                ("load_offset", v_node[b], v_addr[b], i)
+                                            ]
+                                        }
+                                    )
+
+                    self.emit(
+                        {
+                            "valu": [
+                                ("^", v_val[i], s_val + offs[i], v_node[i])
+                                for i in range(remainder)
+                            ]
+                        }
+                    )
 
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                         c1, c3 = hash_consts[hi]

@@ -127,7 +127,7 @@ AFTER (1 cycle):
 ### Session 1 (Previous)
 - Implemented vectorized kernel: 6592 cycles
 
-### Session 2 (Current)
+### Session 2
 | Change | Cycles | Speedup | Notes |
 |--------|--------|---------|-------|
 | Baseline | 147,734 | 1× | Original scalar code |
@@ -141,11 +141,22 @@ AFTER (1 cycle):
 | wrap vselect→multiply | 5,054 | 29.2× | Replace wrap vselect |
 | 3-batch broadcast | 4,294 | 34.4× | Optimize broadcast rounds |
 
+### Session 3 (Current)
+| Change | Cycles | Speedup | Notes |
+|--------|--------|---------|-------|
+| Start | 4,294 | 34.4× | From previous session |
+| Init batching | 4,272 | 34.6× | Batch const loads, hash broadcasts |
+| Vector broadcasts | 4,150 | 35.6× | 5 broadcasts in one bundle |
+| XOR+addr merge | 4,010 | 36.8× | Merge XOR with next-triple addr |
+| Broadcast remainder | 4,094→3,996 | 37.0× | Batch remainder ops |
+| Remainder XOR | 3,996 | 37.0× | Batch XOR operations |
+| Triple-0 loads | 3,940 | 37.5× | Batch v_node[2] loads (2/cycle) |
+
 ## Target Thresholds
 | Target | Cycles | Speedup |
 |--------|--------|---------|
 | Baseline | 147,734 | 1× |
-| **Current** | **4,294** | **34.4×** |
+| **Current** | **3,940** | **37.5×** |
 | Opus 4 many hours | <2,164 | 68× |
 | Opus 4.5 casual | <1,790 | 83× |
 | Sonnet 4.5 many hours | <1,548 | 95× |
@@ -154,9 +165,9 @@ AFTER (1 cycle):
 | Opus 4.5 improved | <1,363 | 108× |
 
 ## Current Performance
-- Cycle count: 4,294
-- Speedup: 34.4×
-- Status: Correctness OK; need ~2× more improvement for Opus 4
+- Cycle count: 3,940
+- Speedup: 37.5×
+- Status: Correctness OK; need ~45% more improvement for Opus 4
 
 ## Remaining Optimizations
 
@@ -170,25 +181,34 @@ AFTER (1 cycle):
 - Issue: Unique indices depend on hash values (data-dependent), not tree structure
 - Only rounds 0 and 11 are guaranteed all-zero (already optimized as broadcast)
 
+**Early-round preloading (tree[1..14])**: Preload tree values for rounds 1-3, 12-14 where indices are constrained.
+- Issue: Setup cost (~70 cycles) exceeds per-round savings
+- Explored: `node = tree[2] + (tree[1]-tree[2]) * (idx&1)` for round 1
+
 ### Remaining Opportunities
 
 1. **Cross-round pipelining**: After round N finishes, start loading round N+1's nodes
    - Challenge: Indices aren't known until index update completes
+   - Potential: Use idle load slots in index update phase (5 VALU bundles with no loads)
 
-2. **Idle load slot utilization**: 4393 wasted load slots per kernel
-   - Post-hash index update has 6 VALU-only cycles with idle loads
+2. **Idle load slot utilization**: ~55% of load slots are idle
+   - Current: 3,248 used / 7,118 potential slots = 45.6% utilization
+   - Post-hash index update has 5 VALU-only cycles with 2 idle load slots each
 
-3. **Better remainder handling**: 2 vectors processed sequentially (12 cycles)
-   - Could batch both vectors together (6 cycles)
+3. **VALU bundle merging**: 1,244 pairs of adjacent VALU bundles could merge
+   - Most have data dependencies, but some might be safe
 
-4. **Bundle merging**: Many single-VALU bundles could be merged
+4. **Different batch size**: Try 4-batch or 5-batch processing
+   - Challenge: Remainder handling complexity, scratch space usage
 
 ### Bottleneck Analysis
 
 The fundamental limit is the gather operations (random memory access):
-- 14 gather rounds × ~170 cycles = 2380 cycles in gathers alone
-- Hash computation is fully overlapped with prefetch
-- VALU is not the bottleneck (6 slots, plenty of capacity)
+- 14 gather rounds × 32 vectors × 8 elements = 3,584 gathers
+- At 2 loads/cycle minimum: 1,792 cycles just for gathers
+- Current: 3,940 cycles → ~54% spent on non-gather operations
+- Hash computation is fully overlapped with prefetch within triples
+- VALU is not the bottleneck (6 slots available, typically using 3-6)
 
 ## External References
 - Designing a SIMD Algorithm from Scratch: https://mcyoung.xyz/2023/11/27/simd-base64/
