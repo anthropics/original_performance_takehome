@@ -152,11 +152,18 @@ AFTER (1 cycle):
 | Remainder XOR | 3,996 | 37.0× | Batch XOR operations |
 | Triple-0 loads | 4,030 | 36.7× | Batch v_node[2] loads |
 
-### Session 4 (Current)
+### Session 4
 | Change | Cycles | Speedup | Notes |
 |--------|--------|---------|-------|
 | Start | 4,030 | 36.7× | From commit 9b66c24 |
 | Remainder index batching | 3,946 | 37.4× | Batch all remainder index ops |
+
+### Session 5 (Current)
+| Change | Cycles | Speedup | Notes |
+|--------|--------|---------|-------|
+| Hash fusion + select rounds | 3,765 | 39.2× | Fuse stages 0,2,4; round 1/12 select | 
+| BATCH=6 for all rounds | 3,241 | 45.6× | Fill VALU slots across rounds |
+| Wider prefetch window | 2,905 | 50.9× | Pack gathers into index-update bundles |
 
 ## Detailed Analysis (Session 4)
 
@@ -203,7 +210,7 @@ For rounds 1,2,12,13,14,15: preload unique tree values, use arithmetic selection
 | Target | Cycles | Speedup |
 |--------|--------|---------|
 | Baseline | 147,734 | 1× |
-| **Current** | **3,940** | **37.5×** |
+| **Current** | **2,905** | **50.9×** |
 | Opus 4 many hours | <2,164 | 68× |
 | Opus 4.5 casual | <1,790 | 83× |
 | Sonnet 4.5 many hours | <1,548 | 95× |
@@ -212,9 +219,9 @@ For rounds 1,2,12,13,14,15: preload unique tree values, use arithmetic selection
 | Opus 4.5 improved | <1,363 | 108× |
 
 ## Current Performance
-- Cycle count: 3,940
-- Speedup: 37.5×
-- Status: Correctness OK; need ~45% more improvement for Opus 4
+- Cycle count: 2,905
+- Speedup: 50.9×
+- Status: Correctness OK; need ~1.6× more improvement for Opus 4
 
 ## Remaining Optimizations
 
@@ -223,6 +230,10 @@ For rounds 1,2,12,13,14,15: preload unique tree values, use arithmetic selection
 **Speculative Child Prefetch**: Load both children during hash, select correct one.
 - Issue: Need 48 loads (3 batches × 8 elements × 2 children) but only 24 slots available in hash
 - Would require reducing batch size (2 instead of 3), losing more cycles than saved
+
+**Greedy cross-round prefetch in Scheduler**: Preload next-round nodes into a staging buffer.
+- Issue: Scratch pressure spikes (BATCH>6 overflows), and BATCH=8/12 regresses cycles.
+- Note: Wider prefetch window inside index-update bundles is the only variant that helped.
 
 **Index Deduplication**: Use broadcast for rounds with few unique indices.
 - Issue: Unique indices depend on hash values (data-dependent), not tree structure
