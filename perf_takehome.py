@@ -115,6 +115,19 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        # Precompute batch addresses upfront during init
+        # This eliminates per-iteration address computation (inp_indices_p + batch_off)
+        inp_indices_addrs = self.alloc_scratch("inp_indices_addrs", batch_size)
+        inp_values_addrs = self.alloc_scratch("inp_values_addrs", batch_size)
+
+        # Compute all addresses during initialization
+        for i in range(batch_size):
+            i_const = self.scratch_const(i)
+            # inp_indices_addrs[i] = inp_indices_p + i
+            self.add("alu", ("+", inp_indices_addrs + i, self.scratch["inp_indices_p"], i_const))
+            # inp_values_addrs[i] = inp_values_p + i
+            self.add("alu", ("+", inp_values_addrs + i, self.scratch["inp_values_p"], i_const))
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -133,14 +146,11 @@ class KernelBuilder:
 
         for round in range(rounds):
             for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
+                # idx = mem[inp_indices_p + i] - use precomputed address
+                body.append(("load", ("load", tmp_idx, inp_indices_addrs + i)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
+                # val = mem[inp_values_p + i] - use precomputed address
+                body.append(("load", ("load", tmp_val, inp_values_addrs + i)))
                 body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
                 # node_val = mem[forest_values_p + idx]
                 body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
@@ -161,12 +171,10 @@ class KernelBuilder:
                 body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                # mem[inp_indices_p + i] = idx - use precomputed address
+                body.append(("store", ("store", inp_indices_addrs + i, tmp_idx)))
+                # mem[inp_values_p + i] = val - use precomputed address
+                body.append(("store", ("store", inp_values_addrs + i, tmp_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
