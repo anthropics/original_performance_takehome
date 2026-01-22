@@ -195,8 +195,50 @@ class KernelBuilder:
         self.add_bundle({"load": [("const", num_rounds_s, rounds)]})
         self.add("flow", ("pause",))
 
-        # ===== MAIN LOOP =====
-        self.add_bundle({"load": [("const", round_counter, 0)]})
+        # ===== ROUND 0 SPECIAL CASE =====
+        # All indices start at 0, so we only need ONE forest load!
+        node_scalar = self.alloc_scratch("node_scalar")
+        v_node_shared = self.alloc_scratch("v_node_shared", VLEN)
+
+        # Load forest[0] once and broadcast
+        self.add_bundle({"load": [("load", node_scalar, self.scratch["forest_values_p"])]})
+        self.add_bundle({"valu": [("vbroadcast", v_node_shared, node_scalar)]})
+
+        # Process all batches with shared node_val using 2-way pipelining
+        for b in range(0, num_batches, 2):
+            val_A, val_B = v_val[b], v_val[b + 1]
+            idx_A, idx_B = v_idx[b], v_idx[b + 1]
+
+            # XOR both batches with shared node
+            self.add_bundle({"valu": [("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared)]})
+
+            # Hash stage 0 for both
+            vc1_0, vc2_0 = v_hash_consts[0]
+            op1_0, _, op2_0, op3_0, _ = HASH_STAGES[0]
+            self.add_bundle({"valu": [
+                (op1_0, v_tmp1_A, val_A, vc1_0), (op3_0, v_tmp2_A, val_A, vc2_0),
+                (op1_0, v_tmp1_B, val_B, vc1_0), (op3_0, v_tmp2_B, val_B, vc2_0),
+            ]})
+            self.add_bundle({"valu": [(op2_0, val_A, v_tmp1_A, v_tmp2_A), (op2_0, val_B, v_tmp1_B, v_tmp2_B)]})
+
+            # Hash stages 1-5 interleaved
+            for hi in range(1, 6):
+                vc1, vc2 = v_hash_consts[hi]
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                self.add_bundle({"valu": [
+                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                ]})
+                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+
+            # idx = 2*0 + (val%2 + 1) = val%2 + 1 (since idx starts at 0)
+            # A: idx_A = (val_A & 1) + 1
+            self.add_bundle({"valu": [("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one)]})
+            self.add_bundle({"valu": [("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one)]})
+            # No bounds check needed - idx will be 1 or 2, both < n_nodes
+
+        # ===== MAIN LOOP (rounds 1-15) =====
+        self.add_bundle({"load": [("const", round_counter, 1)]})
         round_loop_start = len(self.instrs)
 
         # Process pairs with optimized 2-way pipeline
