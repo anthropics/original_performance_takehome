@@ -141,7 +141,7 @@ AFTER (1 cycle):
 | wrap vselect→multiply | 5,054 | 29.2× | Replace wrap vselect |
 | 3-batch broadcast | 4,294 | 34.4× | Optimize broadcast rounds |
 
-### Session 3 (Current)
+### Session 3
 | Change | Cycles | Speedup | Notes |
 |--------|--------|---------|-------|
 | Start | 4,294 | 34.4× | From previous session |
@@ -150,7 +150,54 @@ AFTER (1 cycle):
 | XOR+addr merge | 4,010 | 36.8× | Merge XOR with next-triple addr |
 | Broadcast remainder | 4,094→3,996 | 37.0× | Batch remainder ops |
 | Remainder XOR | 3,996 | 37.0× | Batch XOR operations |
-| Triple-0 loads | 3,940 | 37.5× | Batch v_node[2] loads (2/cycle) |
+| Triple-0 loads | 4,030 | 36.7× | Batch v_node[2] loads |
+
+### Session 4 (Current)
+| Change | Cycles | Speedup | Notes |
+|--------|--------|---------|-------|
+| Start | 4,030 | 36.7× | From commit 9b66c24 |
+| Remainder index batching | 3,946 | 37.4× | Batch all remainder index ops |
+
+## Detailed Analysis (Session 4)
+
+### Bundle Distribution
+| (VALU, LOAD, STORE) | Count | Description |
+|---------------------|-------|-------------|
+| (3, 0, 0) | 982 | Hash stage2 without loads (WASTE) |
+| (6, 2, 0) | 812 | Hash stage1 with prefetch (optimal) |
+| (3, 2, 0) | 812 | Hash stage2 with prefetch |
+| (6, 0, 0) | 434 | Various 6-op bundles |
+| (0, 1, 0) | 211 | Load-only bundles |
+| (2, 0, 0) | 198 | 2-op bundles |
+
+### VALU Utilization
+- Total VALU ops: 13,779
+- Total bundles: 3,946
+- VALU utilization: 58.2% (wasting 6,423 VALU slots)
+- Low-util bundles (1-3 VALU): 1,994 bundles
+
+### Theoretical Limits
+- **VALU-bound minimum**: 13,312 ops / 6 = 2,219 cycles
+- **Load-bound minimum**: 3,586 loads / 2 = 1,793 cycles
+- **Actual**: 3,946 cycles
+
+### Tree Structure Insight
+Indices follow predictable patterns after broadcast rounds:
+| Round | Unique Indices | Type |
+|-------|----------------|------|
+| 0 | 1 | broadcast (all at 0) |
+| 1 | 2 | speculative ({1,2}) |
+| 2 | 4 | speculative ({3-6}) |
+| 3-10 | 8-224 | normal (diverging) |
+| 11 | 1 | broadcast (all wrap to 0) |
+| 12 | 2 | speculative ({1,2}) |
+| 13-15 | 4-16 | speculative |
+
+### Speculative Execution Potential
+For rounds 1,2,12,13,14,15: preload unique tree values, use arithmetic selection.
+- Load savings: 1,500 loads (41.8% reduction)
+- VALU overhead: 576-1,248 ops (depends on selection complexity)
+- **Net savings estimate: ~540-654 cycles**
 
 ## Target Thresholds
 | Target | Cycles | Speedup |

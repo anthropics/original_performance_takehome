@@ -686,32 +686,61 @@ class KernelBuilder:
                             }
                         )
 
-                    for i in range(remainder):
-                        self.emit({"valu": [("&", v_tmp1[i], v_val[i], v_one)]})
-                        self.emit({"valu": [("+", v_tmp2[i], v_one, v_tmp1[i])]})
-                        self.emit(
-                            {
-                                "valu": [
-                                    (
-                                        "multiply_add",
-                                        v_idx[i],
-                                        s_idx + offs[i],
-                                        v_two,
-                                        v_tmp2[i],
-                                    )
-                                ]
-                            }
-                        )
-                        self.emit({"valu": [("<", v_tmp1[i], v_idx[i], v_n_nodes)]})
-                        self.emit({"valu": [("*", v_idx[i], v_idx[i], v_tmp1[i])]})
-                        self.emit(
-                            {
-                                "valu": [
-                                    ("+", s_idx + offs[i], v_idx[i], v_zero),
-                                    ("+", s_val + offs[i], v_val[i], v_zero),
-                                ]
-                            }
-                        )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("&", v_tmp1[i], v_val[i], v_one)
+                                for i in range(remainder)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", v_tmp2[i], v_one, v_tmp1[i])
+                                for i in range(remainder)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_idx[i],
+                                    s_idx + offs[i],
+                                    v_two,
+                                    v_tmp2[i],
+                                )
+                                for i in range(remainder)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
+                                for i in range(remainder)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
+                                for i in range(remainder)
+                            ]
+                        }
+                    )
+                    wb = [
+                        ("+", s_idx + offs[i], v_idx[i], v_zero)
+                        for i in range(remainder)
+                    ]
+                    wb += [
+                        ("+", s_val + offs[i], v_val[i], v_zero)
+                        for i in range(remainder)
+                    ]
+                    self.emit({"valu": wb})
 
         for vi in range(n_vectors):
             off = vi * VLEN
