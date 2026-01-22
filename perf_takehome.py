@@ -49,7 +49,6 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
             instrs.append({engine: [slot]})
@@ -57,6 +56,9 @@ class KernelBuilder:
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
+
+    def emit(self, bundle):
+        self.instrs.append(bundle)
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -76,26 +78,22 @@ class KernelBuilder:
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
-
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
+            slots.append(
+                ("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
+            )
         return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+
         init_vars = [
             "rounds",
             "n_nodes",
@@ -115,65 +113,542 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.alloc_scratch(f"hc1_{hi}", VLEN)
+            c3 = self.alloc_scratch(f"hc3_{hi}", VLEN)
+            self.add("load", ("const", tmp1, val1))
+            self.emit({"valu": [("vbroadcast", c1, tmp1)]})
+            self.add("load", ("const", tmp1, val3))
+            self.emit({"valu": [("vbroadcast", c3, tmp1)]})
+            hash_consts.append((c1, c3))
+
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+
+        self.emit({"valu": [("vbroadcast", v_zero, zero_const)]})
+        self.emit({"valu": [("vbroadcast", v_one, one_const)]})
+        self.emit({"valu": [("vbroadcast", v_two, two_const)]})
+        self.emit({"valu": [("vbroadcast", v_n_nodes, self.scratch["n_nodes"])]})
+        self.emit(
+            {"valu": [("vbroadcast", v_forest_p, self.scratch["forest_values_p"])]}
+        )
+
+        n_vectors = batch_size // VLEN
+        s_idx = self.alloc_scratch("s_idx", n_vectors * VLEN)
+        s_val = self.alloc_scratch("s_val", n_vectors * VLEN)
+
+        v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(3)]
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{i}", VLEN) for i in range(3)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{i}", VLEN) for i in range(3)]
+        v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(3)]
+        v_node = [self.alloc_scratch(f"v_node_{i}", VLEN) for i in range(3)]
+        v_addr = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(3)]
+        v_node_next = [self.alloc_scratch(f"v_node_next_{i}", VLEN) for i in range(3)]
+        v_addr_next = [self.alloc_scratch(f"v_addr_next_{i}", VLEN) for i in range(3)]
+
+        v_broadcast_node = self.alloc_scratch("v_broadcast_node", VLEN)
+        addr_tmp = self.alloc_scratch("addr_tmp")
+
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        for vi in range(n_vectors):
+            off = vi * VLEN
+            self.emit({"load": [("const", addr_tmp, off)]})
+            self.emit(
+                {"alu": [("+", addr_tmp, self.scratch["inp_indices_p"], addr_tmp)]}
+            )
+            self.emit({"load": [("vload", s_idx + off, addr_tmp)]})
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        for vi in range(n_vectors):
+            off = vi * VLEN
+            self.emit({"load": [("const", addr_tmp, off)]})
+            self.emit(
+                {"alu": [("+", addr_tmp, self.scratch["inp_values_p"], addr_tmp)]}
+            )
+            self.emit({"load": [("vload", s_val + off, addr_tmp)]})
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        broadcast_rounds = {0, 11}
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        for rnd in range(rounds):
+            is_broadcast_round = rnd in broadcast_rounds
+
+            if is_broadcast_round:
+                self.emit({"load": [("load", tmp1, self.scratch["forest_values_p"])]})
+                self.emit({"valu": [("vbroadcast", v_broadcast_node, tmp1)]})
+
+                n_triples_bc = n_vectors // 3
+                remainder_bc = n_vectors % 3
+
+                for triple in range(n_triples_bc):
+                    offs = [(triple * 3 + i) * VLEN for i in range(3)]
+                    self.emit(
+                        {
+                            "valu": [
+                                ("^", v_val[0], s_val + offs[0], v_broadcast_node),
+                                ("^", v_val[1], s_val + offs[1], v_broadcast_node),
+                                ("^", v_val[2], s_val + offs[2], v_broadcast_node),
+                            ]
+                        }
+                    )
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        c1, c3 = hash_consts[hi]
+                        self.emit(
+                            {
+                                "valu": [
+                                    (op1, v_tmp1[0], v_val[0], c1),
+                                    (op1, v_tmp1[1], v_val[1], c1),
+                                    (op1, v_tmp1[2], v_val[2], c1),
+                                    (op3, v_tmp2[0], v_val[0], c3),
+                                    (op3, v_tmp2[1], v_val[1], c3),
+                                    (op3, v_tmp2[2], v_val[2], c3),
+                                ]
+                            }
+                        )
+                        self.emit(
+                            {
+                                "valu": [
+                                    (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
+                                    (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
+                                    (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                ]
+                            }
+                        )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("&", v_tmp1[0], v_val[0], v_one),
+                                ("&", v_tmp1[1], v_val[1], v_one),
+                                ("&", v_tmp1[2], v_val[2], v_one),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", v_tmp2[0], v_one, v_tmp1[0]),
+                                ("+", v_tmp2[1], v_one, v_tmp1[1]),
+                                ("+", v_tmp2[2], v_one, v_tmp1[2]),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_idx[0],
+                                    s_idx + offs[0],
+                                    v_two,
+                                    v_tmp2[0],
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_idx[1],
+                                    s_idx + offs[1],
+                                    v_two,
+                                    v_tmp2[1],
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_idx[2],
+                                    s_idx + offs[2],
+                                    v_two,
+                                    v_tmp2[2],
+                                ),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("<", v_tmp1[0], v_idx[0], v_n_nodes),
+                                ("<", v_tmp1[1], v_idx[1], v_n_nodes),
+                                ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("*", v_idx[0], v_idx[0], v_tmp1[0]),
+                                ("*", v_idx[1], v_idx[1], v_tmp1[1]),
+                                ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_idx + offs[0], v_idx[0], v_zero),
+                                ("+", s_idx + offs[1], v_idx[1], v_zero),
+                                ("+", s_idx + offs[2], v_idx[2], v_zero),
+                                ("+", s_val + offs[0], v_val[0], v_zero),
+                                ("+", s_val + offs[1], v_val[1], v_zero),
+                                ("+", s_val + offs[2], v_val[2], v_zero),
+                            ]
+                        }
+                    )
+
+                for i in range(remainder_bc):
+                    off = (n_triples_bc * 3 + i) * VLEN
+                    self.emit(
+                        {"valu": [("^", v_val[0], s_val + off, v_broadcast_node)]}
+                    )
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        c1, c3 = hash_consts[hi]
+                        self.emit(
+                            {
+                                "valu": [
+                                    (op1, v_tmp1[0], v_val[0], c1),
+                                    (op3, v_tmp2[0], v_val[0], c3),
+                                ]
+                            }
+                        )
+                        self.emit({"valu": [(op2, v_val[0], v_tmp1[0], v_tmp2[0])]})
+                    self.emit({"valu": [("&", v_tmp1[0], v_val[0], v_one)]})
+                    self.emit({"valu": [("+", v_tmp2[0], v_one, v_tmp1[0])]})
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_idx[0],
+                                    s_idx + off,
+                                    v_two,
+                                    v_tmp2[0],
+                                )
+                            ]
+                        }
+                    )
+                    self.emit({"valu": [("<", v_tmp1[0], v_idx[0], v_n_nodes)]})
+                    self.emit({"valu": [("*", v_idx[0], v_idx[0], v_tmp1[0])]})
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_idx + off, v_idx[0], v_zero),
+                                ("+", s_val + off, v_val[0], v_zero),
+                            ]
+                        }
+                    )
+            else:
+                n_triples = n_vectors // 3
+                remainder = n_vectors % 3
+
+                for triple in range(n_triples):
+                    offs = [(triple * 3 + i) * VLEN for i in range(3)]
+                    has_next = triple < n_triples - 1 or remainder > 0
+                    next_offs = []
+                    if has_next:
+                        if triple < n_triples - 1:
+                            next_offs = [
+                                ((triple + 1) * 3 + i) * VLEN for i in range(3)
+                            ]
+                        else:
+                            next_offs = [
+                                (n_triples * 3 + i) * VLEN for i in range(remainder)
+                            ]
+
+                    if triple == 0:
+                        self.emit(
+                            {
+                                "valu": [
+                                    ("+", v_addr[0], v_forest_p, s_idx + offs[0]),
+                                    ("+", v_addr[1], v_forest_p, s_idx + offs[1]),
+                                    ("+", v_addr[2], v_forest_p, s_idx + offs[2]),
+                                ]
+                            }
+                        )
+                        for i in range(VLEN):
+                            self.emit(
+                                {
+                                    "load": [
+                                        ("load_offset", v_node[0], v_addr[0], i),
+                                        ("load_offset", v_node[1], v_addr[1], i),
+                                    ]
+                                }
+                            )
+                        for i in range(VLEN):
+                            self.emit(
+                                {"load": [("load_offset", v_node[2], v_addr[2], i)]}
+                            )
+
+                    self.emit(
+                        {
+                            "valu": [
+                                ("^", v_val[0], s_val + offs[0], v_node[0]),
+                                ("^", v_val[1], s_val + offs[1], v_node[1]),
+                                ("^", v_val[2], s_val + offs[2], v_node[2]),
+                            ]
+                        }
+                    )
+
+                    if has_next:
+                        next_count = 3 if triple < n_triples - 1 else remainder
+                        self.emit(
+                            {
+                                "valu": [
+                                    (
+                                        "+",
+                                        v_addr_next[i],
+                                        v_forest_p,
+                                        s_idx + next_offs[i],
+                                    )
+                                    for i in range(next_count)
+                                ]
+                            }
+                        )
+
+                    prefetch_idx = 0
+                    next_count = (
+                        3
+                        if (has_next and triple < n_triples - 1)
+                        else (remainder if has_next else 0)
+                    )
+
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        c1, c3 = hash_consts[hi]
+                        loads = []
+                        for _ in range(2):
+                            if has_next and prefetch_idx < VLEN * next_count:
+                                bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                                if bi < next_count:
+                                    loads.append(
+                                        (
+                                            "load_offset",
+                                            v_node_next[bi],
+                                            v_addr_next[bi],
+                                            ei,
+                                        )
+                                    )
+                                    prefetch_idx += 1
+                        self.emit(
+                            {
+                                "valu": [
+                                    (op1, v_tmp1[0], v_val[0], c1),
+                                    (op1, v_tmp1[1], v_val[1], c1),
+                                    (op1, v_tmp1[2], v_val[2], c1),
+                                    (op3, v_tmp2[0], v_val[0], c3),
+                                    (op3, v_tmp2[1], v_val[1], c3),
+                                    (op3, v_tmp2[2], v_val[2], c3),
+                                ],
+                                **({"load": loads} if loads else {}),
+                            }
+                        )
+                        loads = []
+                        for _ in range(2):
+                            if has_next and prefetch_idx < VLEN * next_count:
+                                bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                                if bi < next_count:
+                                    loads.append(
+                                        (
+                                            "load_offset",
+                                            v_node_next[bi],
+                                            v_addr_next[bi],
+                                            ei,
+                                        )
+                                    )
+                                    prefetch_idx += 1
+                        self.emit(
+                            {
+                                "valu": [
+                                    (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
+                                    (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
+                                    (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                ],
+                                **({"load": loads} if loads else {}),
+                            }
+                        )
+
+                    while has_next and prefetch_idx < VLEN * next_count:
+                        loads = []
+                        for _ in range(2):
+                            if prefetch_idx < VLEN * next_count:
+                                bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                                if bi < next_count:
+                                    loads.append(
+                                        (
+                                            "load_offset",
+                                            v_node_next[bi],
+                                            v_addr_next[bi],
+                                            ei,
+                                        )
+                                    )
+                                    prefetch_idx += 1
+                        if loads:
+                            self.emit({"load": loads})
+
+                    self.emit(
+                        {
+                            "valu": [
+                                ("&", v_tmp1[0], v_val[0], v_one),
+                                ("&", v_tmp1[1], v_val[1], v_one),
+                                ("&", v_tmp1[2], v_val[2], v_one),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", v_tmp2[0], v_one, v_tmp1[0]),
+                                ("+", v_tmp2[1], v_one, v_tmp1[1]),
+                                ("+", v_tmp2[2], v_one, v_tmp1[2]),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_idx[0],
+                                    s_idx + offs[0],
+                                    v_two,
+                                    v_tmp2[0],
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_idx[1],
+                                    s_idx + offs[1],
+                                    v_two,
+                                    v_tmp2[1],
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_idx[2],
+                                    s_idx + offs[2],
+                                    v_two,
+                                    v_tmp2[2],
+                                ),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("<", v_tmp1[0], v_idx[0], v_n_nodes),
+                                ("<", v_tmp1[1], v_idx[1], v_n_nodes),
+                                ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("*", v_idx[0], v_idx[0], v_tmp1[0]),
+                                ("*", v_idx[1], v_idx[1], v_tmp1[1]),
+                                ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_idx + offs[0], v_idx[0], v_zero),
+                                ("+", s_idx + offs[1], v_idx[1], v_zero),
+                                ("+", s_idx + offs[2], v_idx[2], v_zero),
+                                ("+", s_val + offs[0], v_val[0], v_zero),
+                                ("+", s_val + offs[1], v_val[1], v_zero),
+                                ("+", s_val + offs[2], v_val[2], v_zero),
+                            ]
+                        }
+                    )
+
+                    if has_next:
+                        v_node, v_node_next = v_node_next, v_node
+                        v_addr, v_addr_next = v_addr_next, v_addr
+
+                if remainder > 0:
+                    offs = [(n_triples * 3 + i) * VLEN for i in range(remainder)]
+                    if n_triples == 0:
+                        for i in range(remainder):
+                            self.emit(
+                                {
+                                    "valu": [
+                                        ("+", v_addr[i], v_forest_p, s_idx + offs[i])
+                                    ]
+                                }
+                            )
+                        for b in range(remainder):
+                            for i in range(VLEN):
+                                self.emit(
+                                    {"load": [("load_offset", v_node[b], v_addr[b], i)]}
+                                )
+
+                    for i in range(remainder):
+                        self.emit(
+                            {"valu": [("^", v_val[i], s_val + offs[i], v_node[i])]}
+                        )
+
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        c1, c3 = hash_consts[hi]
+                        ops1 = [
+                            (op1, v_tmp1[i], v_val[i], c1) for i in range(remainder)
+                        ]
+                        ops1 += [
+                            (op3, v_tmp2[i], v_val[i], c3) for i in range(remainder)
+                        ]
+                        self.emit({"valu": ops1})
+                        self.emit(
+                            {
+                                "valu": [
+                                    (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                    for i in range(remainder)
+                                ]
+                            }
+                        )
+
+                    for i in range(remainder):
+                        self.emit({"valu": [("&", v_tmp1[i], v_val[i], v_one)]})
+                        self.emit({"valu": [("+", v_tmp2[i], v_one, v_tmp1[i])]})
+                        self.emit(
+                            {
+                                "valu": [
+                                    (
+                                        "multiply_add",
+                                        v_idx[i],
+                                        s_idx + offs[i],
+                                        v_two,
+                                        v_tmp2[i],
+                                    )
+                                ]
+                            }
+                        )
+                        self.emit({"valu": [("<", v_tmp1[i], v_idx[i], v_n_nodes)]})
+                        self.emit({"valu": [("*", v_idx[i], v_idx[i], v_tmp1[i])]})
+                        self.emit(
+                            {
+                                "valu": [
+                                    ("+", s_idx + offs[i], v_idx[i], v_zero),
+                                    ("+", s_val + offs[i], v_val[i], v_zero),
+                                ]
+                            }
+                        )
+
+        for vi in range(n_vectors):
+            off = vi * VLEN
+            self.emit({"load": [("const", addr_tmp, off)]})
+            self.emit(
+                {"alu": [("+", addr_tmp, self.scratch["inp_indices_p"], addr_tmp)]}
+            )
+            self.emit({"store": [("vstore", addr_tmp, s_idx + off)]})
+
+        for vi in range(n_vectors):
+            off = vi * VLEN
+            self.emit({"load": [("const", addr_tmp, off)]})
+            self.emit(
+                {"alu": [("+", addr_tmp, self.scratch["inp_values_p"], addr_tmp)]}
+            )
+            self.emit({"store": [("vstore", addr_tmp, s_val + off)]})
+
+        self.emit({"flow": [("pause",)]})
+
 
 BASELINE = 147734
+
 
 def do_kernel_test(
     forest_height: int,
