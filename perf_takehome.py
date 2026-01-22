@@ -421,11 +421,166 @@ class KernelBuilder:
             else:
                 self.add_bundle({"flow": [("vselect", idx_B, v_tmp1_B, idx_B, v_zero)]})
 
-        # Round loop control
+        # Round loop control - loop for rounds 2-10 only (9 iterations)
         self.add_bundle({"flow": [("add_imm", round_counter, round_counter, 1)]})
-        self.add_bundle({"alu": [("<", tmp1, round_counter, num_rounds_s)]})
+        eleven_const = self.scratch_const(11)
+        self.add_bundle({"alu": [("<", tmp1, round_counter, eleven_const)]})
         round_loop_offset = round_loop_start - len(self.instrs) - 1
         self.add_bundle({"flow": [("cond_jump_rel", tmp1, round_loop_offset)]})
+
+        # ===== ROUNDS 11-15: Unrolled (mirror rounds 0-4 after wrapping) =====
+        # After round 10, ALL indices wrap to 0!
+
+        # Round 11 (like round 0): all indices are 0
+        self.add_bundle({"load": [("load", node_scalar, self.scratch["forest_values_p"])]})
+        self.add_bundle({"valu": [("vbroadcast", v_node_shared, node_scalar)]})
+
+        for b in range(0, num_batches, 2):
+            val_A, val_B = v_val[b], v_val[b + 1]
+            idx_A, idx_B = v_idx[b], v_idx[b + 1]
+            self.add_bundle({"valu": [("^", val_A, val_A, v_node_shared), ("^", val_B, val_B, v_node_shared)]})
+            # Hash
+            for hi in range(6):
+                vc1, vc2 = v_hash_consts[hi]
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                self.add_bundle({"valu": [
+                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                ]})
+                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+            # idx = (val & 1) + 1 (since idx starts at 0)
+            self.add_bundle({"valu": [("&", idx_A, val_A, v_one), ("&", idx_B, val_B, v_one)]})
+            self.add_bundle({"valu": [("+", idx_A, idx_A, v_one), ("+", idx_B, idx_B, v_one)]})
+
+        # Round 12 (like round 1): indices in {1,2}
+        self.add_bundle({"flow": [("add_imm", addr1, self.scratch["forest_values_p"], 1)]})
+        self.add_bundle({"flow": [("add_imm", addr2, self.scratch["forest_values_p"], 2)]})
+        self.add_bundle({"load": [("load", node1_scalar, addr1), ("load", node2_scalar, addr2)]})
+        self.add_bundle({"valu": [("vbroadcast", v_node1, node1_scalar), ("vbroadcast", v_node2, node2_scalar)]})
+
+        for b in range(0, num_batches, 2):
+            val_A, val_B = v_val[b], v_val[b + 1]
+            idx_A, idx_B = v_idx[b], v_idx[b + 1]
+            # Select: idx==1 -> v_node1, idx==2 -> v_node2
+            self.add_bundle({"valu": [("==", v_tmp1_A, idx_A, v_one), ("==", v_tmp1_B, idx_B, v_one)]})
+            self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_node1, v_node2)]})
+            self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_node1, v_node2)]})
+            self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
+            # Hash
+            for hi in range(6):
+                vc1, vc2 = v_hash_consts[hi]
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                self.add_bundle({"valu": [
+                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                ]})
+                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+            # idx = 2*idx + (val%2 + 1)
+            self.add_bundle({"valu": [("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one)]})
+            self.add_bundle({"valu": [("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one)]})
+            self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
+            self.add_bundle({"valu": [("+", idx_A, idx_A, v_tmp1_A), ("+", idx_B, idx_B, v_tmp1_B)]})
+            # No bounds check needed - indices will be {3,4,5,6} < n_nodes
+
+        # Rounds 13-15: Use gather approach (indices are larger but still manageable)
+        for _round in range(13, 16):
+            for b in range(0, num_batches, 2):
+                idx_A, val_A = v_idx[b], v_val[b]
+                idx_B, val_B = v_idx[b + 1], v_val[b + 1]
+
+                # Compute addresses and gather
+                self.add_bundle({"alu": [
+                    ("+", addr_A[i], self.scratch["forest_values_p"], idx_A + i) for i in range(VLEN)
+                ] + [("+", addr_B[j], self.scratch["forest_values_p"], idx_B + j) for j in range(4)]})
+
+                self.add_bundle({
+                    "load": [("load", v_node_A + 0, addr_A[0]), ("load", v_node_A + 1, addr_A[1])],
+                    "alu": [("+", addr_B[j], self.scratch["forest_values_p"], idx_B + j) for j in range(4, VLEN)],
+                })
+                for i in range(2, VLEN, 2):
+                    self.add_bundle({"load": [("load", v_node_A + i, addr_A[i]), ("load", v_node_A + i + 1, addr_A[i + 1])]})
+
+                self.add_bundle({
+                    "load": [("load", v_node_B + 0, addr_B[0]), ("load", v_node_B + 1, addr_B[1])],
+                    "valu": [("^", val_A, val_A, v_node_A)],
+                })
+
+                # Interleaved hash with B gathers
+                vc1, vc2 = v_hash_consts[0]
+                op1, _, op2, op3, _ = HASH_STAGES[0]
+                self.add_bundle({
+                    "load": [("load", v_node_B + 2, addr_B[2]), ("load", v_node_B + 3, addr_B[3])],
+                    "valu": [(op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2)],
+                })
+
+                vc1_1, vc2_1 = v_hash_consts[1]
+                op1_1, _, op2_1, op3_1, _ = HASH_STAGES[1]
+                self.add_bundle({
+                    "load": [("load", v_node_B + 4, addr_B[4]), ("load", v_node_B + 5, addr_B[5])],
+                    "valu": [(op2, val_A, v_tmp1_A, v_tmp2_A)],
+                })
+
+                self.add_bundle({
+                    "load": [("load", v_node_B + 6, addr_B[6]), ("load", v_node_B + 7, addr_B[7])],
+                    "valu": [(op1_1, v_tmp1_A, val_A, vc1_1), (op3_1, v_tmp2_A, val_A, vc2_1)],
+                })
+
+                self.add_bundle({"valu": [
+                    (op2_1, val_A, v_tmp1_A, v_tmp2_A),
+                    ("^", val_B, val_B, v_node_B),
+                ]})
+
+                # Interleaved hash stages
+                for hi in range(2, 6):
+                    vc1_A, vc2_A = v_hash_consts[hi]
+                    op1_A, _, op2_A, op3_A, _ = HASH_STAGES[hi]
+                    vc1_B, vc2_B = v_hash_consts[hi - 2]
+                    op1_B, _, op2_B, op3_B, _ = HASH_STAGES[hi - 2]
+
+                    self.add_bundle({"valu": [
+                        (op1_A, v_tmp1_A, val_A, vc1_A), (op3_A, v_tmp2_A, val_A, vc2_A),
+                        (op1_B, v_tmp1_B, val_B, vc1_B), (op3_B, v_tmp2_B, val_B, vc2_B),
+                    ]})
+                    self.add_bundle({"valu": [
+                        (op2_A, val_A, v_tmp1_A, v_tmp2_A),
+                        (op2_B, val_B, v_tmp1_B, v_tmp2_B),
+                    ]})
+
+                # A idx + B hash 4-5
+                vc1_4, vc2_4 = v_hash_consts[4]
+                op1_4, _, op2_4, op3_4, _ = HASH_STAGES[4]
+                self.add_bundle({"valu": [
+                    ("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one),
+                    (op1_4, v_tmp1_B, val_B, vc1_4), (op3_4, v_tmp2_B, val_B, vc2_4),
+                ]})
+
+                self.add_bundle({"valu": [
+                    ("+", v_tmp1_A, v_tmp1_A, v_one),
+                    (op2_4, val_B, v_tmp1_B, v_tmp2_B),
+                ]})
+
+                vc1_5, vc2_5 = v_hash_consts[5]
+                op1_5, _, op2_5, op3_5, _ = HASH_STAGES[5]
+                self.add_bundle({"valu": [
+                    ("+", idx_A, idx_A, v_tmp1_A),
+                    (op1_5, v_tmp1_B, val_B, vc1_5), (op3_5, v_tmp2_B, val_B, vc2_5),
+                ]})
+
+                self.add_bundle({"valu": [
+                    ("<", v_tmp1_A, idx_A, v_n_nodes),
+                    (op2_5, val_B, v_tmp1_B, v_tmp2_B),
+                ]})
+
+                # A vselect + B idx
+                self.add_bundle({
+                    "valu": [("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one)],
+                    "flow": [("vselect", idx_A, v_tmp1_A, idx_A, v_zero)],
+                })
+
+                self.add_bundle({"valu": [("+", v_tmp1_B, v_tmp1_B, v_one)]})
+                self.add_bundle({"valu": [("+", idx_B, idx_B, v_tmp1_B)]})
+                self.add_bundle({"valu": [("<", v_tmp1_B, idx_B, v_n_nodes)]})
+                self.add_bundle({"flow": [("vselect", idx_B, v_tmp1_B, idx_B, v_zero)]})
 
         # Store all indices and values back
         self.add_bundle({"alu": [("+", ptr, self.scratch["inp_indices_p"], zero_const)]})
