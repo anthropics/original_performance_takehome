@@ -160,26 +160,35 @@ AFTER (1 cycle):
 
 ## Remaining Optimizations
 
-### 1. Speculative Child Prefetch (Most Promising)
-Load BOTH children during hash computation, select correct one after:
-- `left_child = 2*idx + 1`, `right_child = 2*idx + 2`
-- Prefetch `tree[left]` and `tree[right]` during 12-cycle hash
-- After hash: `vselect` correct child based on `val % 2`
-- **Benefit**: Eliminates 12-cycle prologue per round (saves ~168 cycles)
-- **Cost**: 2× loads, but fits in available load slots during hash
-- **Caveat**: Must wrap speculative indices before computing addresses
+### Approaches Explored (Not Viable)
 
-### 2. Cross-round pipelining
-Prefetch round N+1's first triple during round N's last triple
+**Speculative Child Prefetch**: Load both children during hash, select correct one.
+- Issue: Need 48 loads (3 batches × 8 elements × 2 children) but only 24 slots available in hash
+- Would require reducing batch size (2 instead of 3), losing more cycles than saved
 
-### 3. Better prologue overlap
-12 cycles of gathers at start of each round have idle VALU slots
+**Index Deduplication**: Use broadcast for rounds with few unique indices.
+- Issue: Unique indices depend on hash values (data-dependent), not tree structure
+- Only rounds 0 and 11 are guaranteed all-zero (already optimized as broadcast)
 
-### 4. Remainder optimization
-2 vectors processed inefficiently with separate sequential loops
+### Remaining Opportunities
 
-### 5. Index update phase optimization
-After hash, 6 VALU-only cycles have completely idle Load slots
+1. **Cross-round pipelining**: After round N finishes, start loading round N+1's nodes
+   - Challenge: Indices aren't known until index update completes
+
+2. **Idle load slot utilization**: 4393 wasted load slots per kernel
+   - Post-hash index update has 6 VALU-only cycles with idle loads
+
+3. **Better remainder handling**: 2 vectors processed sequentially (12 cycles)
+   - Could batch both vectors together (6 cycles)
+
+4. **Bundle merging**: Many single-VALU bundles could be merged
+
+### Bottleneck Analysis
+
+The fundamental limit is the gather operations (random memory access):
+- 14 gather rounds × ~170 cycles = 2380 cycles in gathers alone
+- Hash computation is fully overlapped with prefetch
+- VALU is not the bottleneck (6 slots, plenty of capacity)
 
 ## External References
 - Designing a SIMD Algorithm from Scratch: https://mcyoung.xyz/2023/11/27/simd-base64/
