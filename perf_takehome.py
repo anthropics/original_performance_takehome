@@ -456,17 +456,16 @@ class KernelBuilder:
                     ]
                     self.emit({"valu": wb_bc})
             elif is_select_round:
-                n_triples_sel = n_vectors // 3
-                remainder_sel = n_vectors % 3
+                n_batches_sel = n_vectors // BATCH
+                remainder_sel = n_vectors % BATCH
 
-                for triple in range(n_triples_sel):
-                    offs = [(triple * 3 + i) * VLEN for i in range(3)]
+                for batch in range(n_batches_sel):
+                    offs = [(batch * BATCH + i) * VLEN for i in range(BATCH)]
                     self.emit(
                         {
                             "valu": [
-                                ("-", v_tmp1[0], s_idx + offs[0], v_one),
-                                ("-", v_tmp1[1], s_idx + offs[1], v_one),
-                                ("-", v_tmp1[2], s_idx + offs[2], v_one),
+                                ("-", v_tmp1[i], s_idx + offs[i], v_one)
+                                for i in range(BATCH)
                             ]
                         }
                     )
@@ -475,34 +474,20 @@ class KernelBuilder:
                             "valu": [
                                 (
                                     "multiply_add",
-                                    v_node[0],
-                                    v_tmp1[0],
+                                    v_node[i],
+                                    v_tmp1[i],
                                     v_tree_diff,
                                     v_tree_1,
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_node[1],
-                                    v_tmp1[1],
-                                    v_tree_diff,
-                                    v_tree_1,
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_node[2],
-                                    v_tmp1[2],
-                                    v_tree_diff,
-                                    v_tree_1,
-                                ),
+                                )
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("^", v_val[0], s_val + offs[0], v_node[0]),
-                                ("^", v_val[1], s_val + offs[1], v_node[1]),
-                                ("^", v_val[2], s_val + offs[2], v_node[2]),
+                                ("^", v_val[i], s_val + offs[i], v_node[i])
+                                for i in range(BATCH)
                             ]
                         }
                     )
@@ -515,25 +500,12 @@ class KernelBuilder:
                                     "valu": [
                                         (
                                             "multiply_add",
-                                            v_val[0],
-                                            v_val[0],
+                                            v_val[i],
+                                            v_val[i],
                                             c_factor,
                                             c_const,
-                                        ),
-                                        (
-                                            "multiply_add",
-                                            v_val[1],
-                                            v_val[1],
-                                            c_factor,
-                                            c_const,
-                                        ),
-                                        (
-                                            "multiply_add",
-                                            v_val[2],
-                                            v_val[2],
-                                            c_factor,
-                                            c_const,
-                                        ),
+                                        )
+                                        for i in range(BATCH)
                                     ]
                                 }
                             )
@@ -542,39 +514,38 @@ class KernelBuilder:
                             self.emit(
                                 {
                                     "valu": [
-                                        (op1, v_tmp1[0], v_val[0], c1),
-                                        (op1, v_tmp1[1], v_val[1], c1),
-                                        (op1, v_tmp1[2], v_val[2], c1),
-                                        (op3, v_tmp2[0], v_val[0], c3),
-                                        (op3, v_tmp2[1], v_val[1], c3),
-                                        (op3, v_tmp2[2], v_val[2], c3),
+                                        (op1, v_tmp1[i], v_val[i], c1)
+                                        for i in range(BATCH)
                                     ]
                                 }
                             )
                             self.emit(
                                 {
                                     "valu": [
-                                        (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
-                                        (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
-                                        (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                        (op3, v_tmp2[i], v_val[i], c3)
+                                        for i in range(BATCH)
+                                    ]
+                                }
+                            )
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                        for i in range(BATCH)
                                     ]
                                 }
                             )
                     self.emit(
                         {
                             "valu": [
-                                ("&", v_tmp1[0], v_val[0], v_one),
-                                ("&", v_tmp1[1], v_val[1], v_one),
-                                ("&", v_tmp1[2], v_val[2], v_one),
+                                ("&", v_tmp1[i], v_val[i], v_one) for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("+", v_tmp2[0], v_one, v_tmp1[0]),
-                                ("+", v_tmp2[1], v_one, v_tmp1[1]),
-                                ("+", v_tmp2[2], v_one, v_tmp1[2]),
+                                ("+", v_tmp2[i], v_one, v_tmp1[i]) for i in range(BATCH)
                             ]
                         }
                     )
@@ -583,62 +554,51 @@ class KernelBuilder:
                             "valu": [
                                 (
                                     "multiply_add",
-                                    v_idx[0],
-                                    s_idx + offs[0],
+                                    v_idx[i],
+                                    s_idx + offs[i],
                                     v_two,
-                                    v_tmp2[0],
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_idx[1],
-                                    s_idx + offs[1],
-                                    v_two,
-                                    v_tmp2[1],
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_idx[2],
-                                    s_idx + offs[2],
-                                    v_two,
-                                    v_tmp2[2],
-                                ),
+                                    v_tmp2[i],
+                                )
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("<", v_tmp1[0], v_idx[0], v_n_nodes),
-                                ("<", v_tmp1[1], v_idx[1], v_n_nodes),
-                                ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("*", v_idx[0], v_idx[0], v_tmp1[0]),
-                                ("*", v_idx[1], v_idx[1], v_tmp1[1]),
-                                ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("+", s_idx + offs[0], v_idx[0], v_zero),
-                                ("+", s_idx + offs[1], v_idx[1], v_zero),
-                                ("+", s_idx + offs[2], v_idx[2], v_zero),
-                                ("+", s_val + offs[0], v_val[0], v_zero),
-                                ("+", s_val + offs[1], v_val[1], v_zero),
-                                ("+", s_val + offs[2], v_val[2], v_zero),
+                                ("+", s_idx + offs[i], v_idx[i], v_zero)
+                                for i in range(BATCH)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_val + offs[i], v_val[i], v_zero)
+                                for i in range(BATCH)
                             ]
                         }
                     )
 
                 if remainder_sel > 0:
                     offs_sel = [
-                        (n_triples_sel * 3 + i) * VLEN for i in range(remainder_sel)
+                        (n_batches_sel * BATCH + i) * VLEN for i in range(remainder_sel)
                     ]
                     self.emit(
                         {
@@ -763,95 +723,101 @@ class KernelBuilder:
                     ]
                     self.emit({"valu": wb_sel})
             else:
-                n_triples = n_vectors // 3
-                remainder = n_vectors % 3
+                n_batches = n_vectors // BATCH
+                remainder = n_vectors % BATCH
 
-                for triple in range(n_triples):
-                    offs = [(triple * 3 + i) * VLEN for i in range(3)]
-                    has_next = triple < n_triples - 1 or remainder > 0
+                for batch_idx in range(n_batches):
+                    offs = [(batch_idx * BATCH + i) * VLEN for i in range(BATCH)]
+                    has_next = batch_idx < n_batches - 1 or remainder > 0
                     next_offs = []
                     if has_next:
-                        if triple < n_triples - 1:
+                        if batch_idx < n_batches - 1:
                             next_offs = [
-                                ((triple + 1) * 3 + i) * VLEN for i in range(3)
+                                ((batch_idx + 1) * BATCH + i) * VLEN
+                                for i in range(BATCH)
                             ]
                         else:
                             next_offs = [
-                                (n_triples * 3 + i) * VLEN for i in range(remainder)
+                                (n_batches * BATCH + i) * VLEN for i in range(remainder)
                             ]
 
-                    if triple == 0:
+                    if batch_idx == 0:
                         self.emit(
                             {
                                 "valu": [
-                                    ("+", v_addr[0], v_forest_p, s_idx + offs[0]),
-                                    ("+", v_addr[1], v_forest_p, s_idx + offs[1]),
-                                    ("+", v_addr[2], v_forest_p, s_idx + offs[2]),
+                                    ("+", v_addr[i], v_forest_p, s_idx + offs[i])
+                                    for i in range(BATCH)
                                 ]
                             }
                         )
-                        for i in range(VLEN):
-                            self.emit(
-                                {
-                                    "load": [
-                                        ("load_offset", v_node[0], v_addr[0], i),
-                                        ("load_offset", v_node[1], v_addr[1], i),
-                                    ]
-                                }
-                            )
-                        for i in range(0, VLEN, 2):
-                            if i + 1 < VLEN:
-                                self.emit(
-                                    {
-                                        "load": [
-                                            ("load_offset", v_node[2], v_addr[2], i),
-                                            (
-                                                "load_offset",
-                                                v_node[2],
-                                                v_addr[2],
-                                                i + 1,
-                                            ),
-                                        ]
-                                    }
-                                )
-                            else:
-                                self.emit(
-                                    {"load": [("load_offset", v_node[2], v_addr[2], i)]}
-                                )
+                        for vi in range(BATCH):
+                            for ei in range(0, VLEN, 2):
+                                if ei + 1 < VLEN:
+                                    self.emit(
+                                        {
+                                            "load": [
+                                                (
+                                                    "load_offset",
+                                                    v_node[vi],
+                                                    v_addr[vi],
+                                                    ei,
+                                                ),
+                                                (
+                                                    "load_offset",
+                                                    v_node[vi],
+                                                    v_addr[vi],
+                                                    ei + 1,
+                                                ),
+                                            ]
+                                        }
+                                    )
+                                else:
+                                    self.emit(
+                                        {
+                                            "load": [
+                                                (
+                                                    "load_offset",
+                                                    v_node[vi],
+                                                    v_addr[vi],
+                                                    ei,
+                                                )
+                                            ]
+                                        }
+                                    )
 
                     if has_next:
-                        next_count = 3 if triple < n_triples - 1 else remainder
+                        next_count = BATCH if batch_idx < n_batches - 1 else remainder
                         xor_ops = [
-                            ("^", v_val[0], s_val + offs[0], v_node[0]),
-                            ("^", v_val[1], s_val + offs[1], v_node[1]),
-                            ("^", v_val[2], s_val + offs[2], v_node[2]),
+                            ("^", v_val[i], s_val + offs[i], v_node[i])
+                            for i in range(BATCH)
                         ]
                         addr_ops = [
                             ("+", v_addr_next[i], v_forest_p, s_idx + next_offs[i])
                             for i in range(next_count)
                         ]
-                        self.emit({"valu": xor_ops + addr_ops})
+                        self.emit({"valu": xor_ops[:6]})
+                        if len(addr_ops) > 0:
+                            self.emit({"valu": addr_ops[:6]})
                     else:
                         self.emit(
                             {
                                 "valu": [
-                                    ("^", v_val[0], s_val + offs[0], v_node[0]),
-                                    ("^", v_val[1], s_val + offs[1], v_node[1]),
-                                    ("^", v_val[2], s_val + offs[2], v_node[2]),
+                                    ("^", v_val[i], s_val + offs[i], v_node[i])
+                                    for i in range(BATCH)
                                 ]
                             }
                         )
 
                     prefetch_idx = 0
                     next_count = (
-                        3
-                        if (has_next and triple < n_triples - 1)
+                        BATCH
+                        if (has_next and batch_idx < n_batches - 1)
                         else (remainder if has_next else 0)
                     )
 
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                         hc = hash_consts[hi]
-                        if hc[2]:  # fusable stage
+                        if hc[2]:  # fusable
                             c_factor, c_const = hc[0], hc[1]
                             loads = []
                             for _ in range(2):
@@ -872,30 +838,17 @@ class KernelBuilder:
                                     "valu": [
                                         (
                                             "multiply_add",
-                                            v_val[0],
-                                            v_val[0],
+                                            v_val[i],
+                                            v_val[i],
                                             c_factor,
                                             c_const,
-                                        ),
-                                        (
-                                            "multiply_add",
-                                            v_val[1],
-                                            v_val[1],
-                                            c_factor,
-                                            c_const,
-                                        ),
-                                        (
-                                            "multiply_add",
-                                            v_val[2],
-                                            v_val[2],
-                                            c_factor,
-                                            c_const,
-                                        ),
+                                        )
+                                        for i in range(BATCH)
                                     ],
                                     **({"load": loads} if loads else {}),
                                 }
                             )
-                        else:  # non-fusable stage
+                        else:  # non-fusable: 12 ops (2 bundles) then 6 ops (1 bundle)
                             c1, c3 = hc[0], hc[1]
                             loads = []
                             for _ in range(2):
@@ -914,12 +867,8 @@ class KernelBuilder:
                             self.emit(
                                 {
                                     "valu": [
-                                        (op1, v_tmp1[0], v_val[0], c1),
-                                        (op1, v_tmp1[1], v_val[1], c1),
-                                        (op1, v_tmp1[2], v_val[2], c1),
-                                        (op3, v_tmp2[0], v_val[0], c3),
-                                        (op3, v_tmp2[1], v_val[1], c3),
-                                        (op3, v_tmp2[2], v_val[2], c3),
+                                        (op1, v_tmp1[i], v_val[i], c1)
+                                        for i in range(BATCH)
                                     ],
                                     **({"load": loads} if loads else {}),
                                 }
@@ -941,9 +890,31 @@ class KernelBuilder:
                             self.emit(
                                 {
                                     "valu": [
-                                        (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
-                                        (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
-                                        (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                        (op3, v_tmp2[i], v_val[i], c3)
+                                        for i in range(BATCH)
+                                    ],
+                                    **({"load": loads} if loads else {}),
+                                }
+                            )
+                            loads = []
+                            for _ in range(2):
+                                if has_next and prefetch_idx < VLEN * next_count:
+                                    bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                                    if bi < next_count:
+                                        loads.append(
+                                            (
+                                                "load_offset",
+                                                v_node_next[bi],
+                                                v_addr_next[bi],
+                                                ei,
+                                            )
+                                        )
+                                        prefetch_idx += 1
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                        for i in range(BATCH)
                                     ],
                                     **({"load": loads} if loads else {}),
                                 }
@@ -970,18 +941,14 @@ class KernelBuilder:
                     self.emit(
                         {
                             "valu": [
-                                ("&", v_tmp1[0], v_val[0], v_one),
-                                ("&", v_tmp1[1], v_val[1], v_one),
-                                ("&", v_tmp1[2], v_val[2], v_one),
+                                ("&", v_tmp1[i], v_val[i], v_one) for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("+", v_tmp2[0], v_one, v_tmp1[0]),
-                                ("+", v_tmp2[1], v_one, v_tmp1[1]),
-                                ("+", v_tmp2[2], v_one, v_tmp1[2]),
+                                ("+", v_tmp2[i], v_one, v_tmp1[i]) for i in range(BATCH)
                             ]
                         }
                     )
@@ -990,55 +957,44 @@ class KernelBuilder:
                             "valu": [
                                 (
                                     "multiply_add",
-                                    v_idx[0],
-                                    s_idx + offs[0],
+                                    v_idx[i],
+                                    s_idx + offs[i],
                                     v_two,
-                                    v_tmp2[0],
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_idx[1],
-                                    s_idx + offs[1],
-                                    v_two,
-                                    v_tmp2[1],
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_idx[2],
-                                    s_idx + offs[2],
-                                    v_two,
-                                    v_tmp2[2],
-                                ),
+                                    v_tmp2[i],
+                                )
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("<", v_tmp1[0], v_idx[0], v_n_nodes),
-                                ("<", v_tmp1[1], v_idx[1], v_n_nodes),
-                                ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("*", v_idx[0], v_idx[0], v_tmp1[0]),
-                                ("*", v_idx[1], v_idx[1], v_tmp1[1]),
-                                ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("+", s_idx + offs[0], v_idx[0], v_zero),
-                                ("+", s_idx + offs[1], v_idx[1], v_zero),
-                                ("+", s_idx + offs[2], v_idx[2], v_zero),
-                                ("+", s_val + offs[0], v_val[0], v_zero),
-                                ("+", s_val + offs[1], v_val[1], v_zero),
-                                ("+", s_val + offs[2], v_val[2], v_zero),
+                                ("+", s_idx + offs[i], v_idx[i], v_zero)
+                                for i in range(BATCH)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_val + offs[i], v_val[i], v_zero)
+                                for i in range(BATCH)
                             ]
                         }
                     )
@@ -1048,8 +1004,8 @@ class KernelBuilder:
                         v_addr, v_addr_next = v_addr_next, v_addr
 
                 if remainder > 0:
-                    offs = [(n_triples * 3 + i) * VLEN for i in range(remainder)]
-                    if n_triples == 0:
+                    offs = [(n_batches * BATCH + i) * VLEN for i in range(remainder)]
+                    if n_batches == 0:
                         self.emit(
                             {
                                 "valu": [
