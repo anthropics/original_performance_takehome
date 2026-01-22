@@ -293,8 +293,85 @@ class KernelBuilder:
             self.add_bundle({"flow": [("vselect", idx_A, v_tmp1_A, idx_A, v_zero)]})
             self.add_bundle({"flow": [("vselect", idx_B, v_tmp1_B, idx_B, v_zero)]})
 
-        # ===== MAIN LOOP (rounds 2-15) =====
-        self.add_bundle({"load": [("const", round_counter, 2)]})
+        # ===== ROUND 2 SPECIAL CASE =====
+        # Indices are in {3,4,5,6}, so only 4 forest values needed
+        # vselect tree: 3 vselects per batch (cheaper than 4 gather cycles)
+        v_f3 = self.alloc_scratch("v_f3", VLEN)
+        v_f4 = self.alloc_scratch("v_f4", VLEN)
+        v_f5 = self.alloc_scratch("v_f5", VLEN)
+        v_f6 = self.alloc_scratch("v_f6", VLEN)
+        addr3 = self.alloc_scratch("addr3")
+        addr4 = self.alloc_scratch("addr4")
+        addr5 = self.alloc_scratch("addr5")
+        addr6 = self.alloc_scratch("addr6")
+        fs3 = self.alloc_scratch("fs3")
+        fs4 = self.alloc_scratch("fs4")
+        fs5 = self.alloc_scratch("fs5")
+        fs6 = self.alloc_scratch("fs6")
+        v_r_odd = self.alloc_scratch("v_r_odd", VLEN)
+        v_r_even = self.alloc_scratch("v_r_even", VLEN)
+
+        # Load forest[3..6]
+        self.add_bundle({"flow": [("add_imm", addr3, self.scratch["forest_values_p"], 3)]})
+        self.add_bundle({"flow": [("add_imm", addr4, self.scratch["forest_values_p"], 4)]})
+        self.add_bundle({"load": [("load", fs3, addr3), ("load", fs4, addr4)]})
+        self.add_bundle({"flow": [("add_imm", addr5, self.scratch["forest_values_p"], 5)]})
+        self.add_bundle({"flow": [("add_imm", addr6, self.scratch["forest_values_p"], 6)]})
+        self.add_bundle({"load": [("load", fs5, addr5), ("load", fs6, addr6)]})
+        self.add_bundle({"valu": [
+            ("vbroadcast", v_f3, fs3), ("vbroadcast", v_f4, fs4),
+            ("vbroadcast", v_f5, fs5), ("vbroadcast", v_f6, fs6),
+        ]})
+
+        for b in range(0, num_batches, 2):
+            val_A, val_B = v_val[b], v_val[b + 1]
+            idx_A, idx_B = v_idx[b], v_idx[b + 1]
+
+            # Selection tree for 4 values based on 2 bits
+            # bit0 = idx & 1 (odd/even), bit1 = (idx >> 1) & 1
+            self.add_bundle({"valu": [
+                ("&", v_tmp1_A, idx_A, v_one),  # bit0_A
+                (">>", v_tmp2_A, idx_A, v_one),  # idx_A >> 1
+                ("&", v_tmp1_B, idx_B, v_one),  # bit0_B
+                (">>", v_tmp2_B, idx_B, v_one),  # idx_B >> 1
+            ]})
+            self.add_bundle({"valu": [
+                ("&", v_tmp2_A, v_tmp2_A, v_one),  # bit1_A
+                ("&", v_tmp2_B, v_tmp2_B, v_one),  # bit1_B
+            ]})
+            # r_odd = vselect(bit1, f3, f5): bit1=1->f3, bit1=0->f5
+            # r_even = vselect(bit1, f6, f4): bit1=1->f6, bit1=0->f4
+            self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_A, v_f3, v_f5)]})
+            self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_A, v_f6, v_f4)]})
+            # result = vselect(bit0, r_odd, r_even): bit0=1->odd, bit0=0->even
+            self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_r_odd, v_r_even)]})
+            # Same for B
+            self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_B, v_f3, v_f5)]})
+            self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_B, v_f6, v_f4)]})
+            self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_r_odd, v_r_even)]})
+
+            # XOR and hash
+            self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
+
+            for hi in range(6):
+                vc1, vc2 = v_hash_consts[hi]
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                self.add_bundle({"valu": [
+                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                ]})
+                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+
+            # idx = 2*idx + (val%2 + 1) -- no bounds check needed (idx in {7..14})
+            self.add_bundle({"valu": [
+                ("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one),
+                ("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one),
+            ]})
+            self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
+            self.add_bundle({"valu": [("+", idx_A, idx_A, v_tmp1_A), ("+", idx_B, idx_B, v_tmp1_B)]})
+
+        # ===== MAIN LOOP (rounds 3-10) =====
+        self.add_bundle({"load": [("const", round_counter, 3)]})
         round_loop_start = len(self.instrs)
 
         # Process pairs with optimized 2-way pipeline
@@ -421,7 +498,7 @@ class KernelBuilder:
             else:
                 self.add_bundle({"flow": [("vselect", idx_B, v_tmp1_B, idx_B, v_zero)]})
 
-        # Round loop control - loop for rounds 2-10 only (9 iterations)
+        # Round loop control - loop for rounds 3-10 only (8 iterations)
         self.add_bundle({"flow": [("add_imm", round_counter, round_counter, 1)]})
         eleven_const = self.scratch_const(11)
         self.add_bundle({"alu": [("<", tmp1, round_counter, eleven_const)]})
@@ -482,8 +559,62 @@ class KernelBuilder:
             self.add_bundle({"valu": [("+", idx_A, idx_A, v_tmp1_A), ("+", idx_B, idx_B, v_tmp1_B)]})
             # No bounds check needed - indices will be {3,4,5,6} < n_nodes
 
-        # Rounds 13-15: Use gather approach (indices are larger but still manageable)
-        for _round in range(13, 16):
+        # Round 13 (like round 2): indices in {3,4,5,6}
+        # Reload forest[3..6] and use vselect tree
+        self.add_bundle({"flow": [("add_imm", addr3, self.scratch["forest_values_p"], 3)]})
+        self.add_bundle({"flow": [("add_imm", addr4, self.scratch["forest_values_p"], 4)]})
+        self.add_bundle({"load": [("load", fs3, addr3), ("load", fs4, addr4)]})
+        self.add_bundle({"flow": [("add_imm", addr5, self.scratch["forest_values_p"], 5)]})
+        self.add_bundle({"flow": [("add_imm", addr6, self.scratch["forest_values_p"], 6)]})
+        self.add_bundle({"load": [("load", fs5, addr5), ("load", fs6, addr6)]})
+        self.add_bundle({"valu": [
+            ("vbroadcast", v_f3, fs3), ("vbroadcast", v_f4, fs4),
+            ("vbroadcast", v_f5, fs5), ("vbroadcast", v_f6, fs6),
+        ]})
+
+        for b in range(0, num_batches, 2):
+            val_A, val_B = v_val[b], v_val[b + 1]
+            idx_A, idx_B = v_idx[b], v_idx[b + 1]
+
+            # Selection tree for 4 values
+            self.add_bundle({"valu": [
+                ("&", v_tmp1_A, idx_A, v_one),
+                (">>", v_tmp2_A, idx_A, v_one),
+                ("&", v_tmp1_B, idx_B, v_one),
+                (">>", v_tmp2_B, idx_B, v_one),
+            ]})
+            self.add_bundle({"valu": [
+                ("&", v_tmp2_A, v_tmp2_A, v_one),
+                ("&", v_tmp2_B, v_tmp2_B, v_one),
+            ]})
+            self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_A, v_f3, v_f5)]})
+            self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_A, v_f6, v_f4)]})
+            self.add_bundle({"flow": [("vselect", v_node_A, v_tmp1_A, v_r_odd, v_r_even)]})
+            self.add_bundle({"flow": [("vselect", v_r_odd, v_tmp2_B, v_f3, v_f5)]})
+            self.add_bundle({"flow": [("vselect", v_r_even, v_tmp2_B, v_f6, v_f4)]})
+            self.add_bundle({"flow": [("vselect", v_node_B, v_tmp1_B, v_r_odd, v_r_even)]})
+
+            self.add_bundle({"valu": [("^", val_A, val_A, v_node_A), ("^", val_B, val_B, v_node_B)]})
+
+            for hi in range(6):
+                vc1, vc2 = v_hash_consts[hi]
+                op1, _, op2, op3, _ = HASH_STAGES[hi]
+                self.add_bundle({"valu": [
+                    (op1, v_tmp1_A, val_A, vc1), (op3, v_tmp2_A, val_A, vc2),
+                    (op1, v_tmp1_B, val_B, vc1), (op3, v_tmp2_B, val_B, vc2),
+                ]})
+                self.add_bundle({"valu": [(op2, val_A, v_tmp1_A, v_tmp2_A), (op2, val_B, v_tmp1_B, v_tmp2_B)]})
+
+            # idx = 2*idx + (val%2 + 1) -- no bounds check needed (idx in {7..14})
+            self.add_bundle({"valu": [
+                ("&", v_tmp1_A, val_A, v_one), ("<<", idx_A, idx_A, v_one),
+                ("&", v_tmp1_B, val_B, v_one), ("<<", idx_B, idx_B, v_one),
+            ]})
+            self.add_bundle({"valu": [("+", v_tmp1_A, v_tmp1_A, v_one), ("+", v_tmp1_B, v_tmp1_B, v_one)]})
+            self.add_bundle({"valu": [("+", idx_A, idx_A, v_tmp1_A), ("+", idx_B, idx_B, v_tmp1_B)]})
+
+        # Rounds 14-15: Use gather approach
+        for _round in range(14, 16):
             for b in range(0, num_batches, 2):
                 idx_A, val_A = v_idx[b], v_val[b]
                 idx_B, val_B = v_idx[b + 1], v_val[b + 1]
