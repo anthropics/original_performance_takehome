@@ -65,6 +65,66 @@ Simulated annealing explores the solution space by:
 
 Key difference from GA: SA maintains a single solution path rather than a population.
 
+## Neutral Proposal Generation (CRITICAL)
+
+**The mutate agent must receive NEUTRAL prompts with NO optimization bias.**
+
+### Why This Matters
+
+In SA, the **acceptance criterion** (Metropolis) handles exploration vs exploitation via temperature. The **proposal step** (mutation) should be neutral - it generates neighbors without preference for improvement.
+
+If the orchestrator biases the mutate agent toward improvement:
+- SA collapses into greedy hill-climbing
+- Temperature becomes meaningless (exploration killed at the source)
+- Algorithm gets trapped in local minima
+- Theoretical guarantees are lost
+
+### What to Pass to Mutate Agent
+
+**ONLY these parameters:**
+```
+Task(mutate, "sa CAND_CURRENT CAND_NEIGHBOR $STEP_CATEGORY")
+```
+
+| Parameter | Source | Purpose |
+|-----------|--------|---------|
+| Base dir | "sa" | Directory context |
+| Source | "CAND_CURRENT" | Which candidate to mutate |
+| Dest | "CAND_NEIGHBOR" | Where to write result |
+| Step category | calc_step_size.sh output | Mutation magnitude ceiling |
+
+### What NOT to Pass
+
+| Forbidden | Why |
+|-----------|-----|
+| Current score | Irrelevant to generating neighbors; induces greedy bias |
+| Best score | Same as above |
+| "Try to improve" | Converts SA to hill-climbing |
+| "Push cycles down" | Greedy directive |
+| Strategy suggestions | Narrows search space |
+| Progress commentary | Anchoring bias |
+| Emotional encouragement | Anthropomorphizes, adds implicit goals |
+
+### Correct vs Incorrect Invocation
+
+**WRONG** (biased):
+```
+Task(mutate, "sa CAND_CURRENT CAND_NEIGHBOR moderate - we're at 45000 cycles!
+Try to push lower, maybe with loop unrolling or memory coalescing.")
+```
+
+**WRONG** (score leakage):
+```
+Task(mutate, "sa CAND_CURRENT CAND_NEIGHBOR extensive - current: 52000, best: 48000")
+```
+
+**CORRECT** (neutral):
+```
+Task(mutate, "sa CAND_CURRENT CAND_NEIGHBOR extensive")
+```
+
+The mutate agent will read the code, identify opportunities from the code itself, pick one randomly, and apply it. No external bias needed or wanted.
+
 ## Progress File
 
 Log to `sa/optimization_progress.txt`. This file enables resumption after interruption.
@@ -248,12 +308,13 @@ Log: `[COOL] Temperature: {old} → {new}`
 
 1. **ONE MUTATION AT A TIME**: SA is sequential - process one neighbor per iteration
 2. **CLEANUP BEFORE PERTURB**: Always run cleanup_neighbor.sh before creating a new neighbor
-3. **AGENT ARGS**: Pass base directory, candidate IDs, and step category
+3. **NEUTRAL PROMPTS ONLY**: Pass ONLY the 4 specified parameters to mutate agent - NO scores, NO strategy hints, NO "try to improve". See "Neutral Proposal Generation" section.
+4. **AGENT ARGS**: Pass base directory, candidate IDs, and step category
    - mutate: `sa CAND_CURRENT CAND_NEIGHBOR $STEP_CATEGORY`
    - Calculate STEP_CATEGORY using: `./sa/scripts/calc_step_size.sh $TEMPERATURE $INITIAL_TEMP $FINAL_TEMP`
-4. **STATE PERSISTENCE**: Update state.txt after each iteration for resumption
-5. **METROPOLIS CRITERION**: Use accept_solution.sh for all acceptance decisions
-6. **STEP CATEGORY SCALING**: Always calculate step category before mutation - this ensures extensive exploration at high temp, minimal refinement at low temp
+5. **STATE PERSISTENCE**: Update state.txt after each iteration for resumption
+6. **METROPOLIS CRITERION**: Use accept_solution.sh for all acceptance decisions
+7. **STEP CATEGORY SCALING**: Always calculate step category before mutation - this ensures extensive exploration at high temp, minimal refinement at low temp
 
 ## State File Format
 
