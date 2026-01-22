@@ -1,0 +1,47 @@
+{
+  "skills": {
+    "verify": {
+      "description": "Verify submission integrity and run official tests",
+      "file": "skills/verify.md"
+    },
+    "benchmark": {
+      "description": "Quick performance benchmark (cycle count)",
+      "file": "skills/benchmark.md"
+    },
+    "trace": {
+      "description": "Generate and analyze execution traces",
+      "file": "skills/trace.md"
+    },
+    "optimize": {
+      "description": "Run a structured optimization cycle",
+      "file": "skills/optimize.md"
+    }
+  },
+  "agents": {
+    "vectorizer": {
+      "description": "Specialized agent for vectorization optimizations",
+      "file": "agents/vectorizer.md"
+    },
+    "packer": {
+      "description": "Specialized agent for instruction packing optimizations",
+      "file": "agents/packer.md"
+    },
+    "analyzer": {
+      "description": "Analyze current implementation and identify bottlenecks",
+      "file": "agents/analyzer.md"
+    }
+  },
+  "project": {
+    "optimization_target": "perf_takehome.py",
+    "verification_command": "python tests/submission_tests.py",
+    "benchmark_command": "python perf_takehome.py Tests.test_kernel_cycles",
+    "trace_command": "python perf_takehome.py Tests.test_kernel_trace",
+    "baseline_cycles": 147734,
+    "target_cycles": 1363,
+    "constraints": [
+      "NEVER modify tests/ folder",
+      "Use tests/submission_tests.py for verification",
+      "N_CORES=1 is intentional (no multicore)"
+    ]
+  }
+}

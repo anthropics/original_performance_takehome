@@ -1,0 +1,5 @@
+# GitHub repository settings
+# PRs should target this repo (chris-go fork), not the original anthropics repo
+
+repository:
+  default_branch: main
