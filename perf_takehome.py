@@ -113,13 +113,38 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        # Analyze which hash stages can be fused:
+        # Stages where op1='+', op2='+', op3='<<' can be fused:
+        #   a = (a + c1) + (a << k) = a * (1 + 2^k) + c1 = multiply_add(a, factor, c1)
+        # Stages 0, 2, 4 are fusable; stages 1, 3, 5 are not (XOR patterns)
         hash_consts = []
+        fusable_stages = set()
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1 = self.alloc_scratch(f"hc1_{hi}", VLEN)
-            c3 = self.alloc_scratch(f"hc3_{hi}", VLEN)
-            self.emit({"load": [("const", tmp1, val1), ("const", tmp2, val3)]})
-            self.emit({"valu": [("vbroadcast", c1, tmp1), ("vbroadcast", c3, tmp2)]})
-            hash_consts.append((c1, c3))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # Fusable: multiply_add(a, 1+2^val3, val1)
+                fusable_stages.add(hi)
+                factor = 1 + (1 << val3)
+                c_factor = self.alloc_scratch(f"hc_factor_{hi}", VLEN)
+                c_const = self.alloc_scratch(f"hc_const_{hi}", VLEN)
+                self.emit({"load": [("const", tmp1, factor), ("const", tmp2, val1)]})
+                self.emit(
+                    {
+                        "valu": [
+                            ("vbroadcast", c_factor, tmp1),
+                            ("vbroadcast", c_const, tmp2),
+                        ]
+                    }
+                )
+                hash_consts.append((c_factor, c_const, True))  # True = fusable
+            else:
+                # Not fusable: keep original 3-op pattern
+                c1 = self.alloc_scratch(f"hc1_{hi}", VLEN)
+                c3 = self.alloc_scratch(f"hc3_{hi}", VLEN)
+                self.emit({"load": [("const", tmp1, val1), ("const", tmp2, val3)]})
+                self.emit(
+                    {"valu": [("vbroadcast", c1, tmp1), ("vbroadcast", c3, tmp2)]}
+                )
+                hash_consts.append((c1, c3, False))  # False = not fusable
 
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
@@ -155,6 +180,25 @@ class KernelBuilder:
         v_broadcast_node = self.alloc_scratch("v_broadcast_node", VLEN)
         addr_tmp = self.alloc_scratch("addr_tmp")
 
+        v_tree_1 = self.alloc_scratch("v_tree_1", VLEN)
+        v_tree_2 = self.alloc_scratch("v_tree_2", VLEN)
+        v_tree_diff = self.alloc_scratch("v_tree_diff", VLEN)
+
+        self.emit({"load": [("const", tmp1, 1), ("const", tmp2, 2)]})
+        self.emit(
+            {
+                "alu": [
+                    ("+", tmp1, self.scratch["forest_values_p"], tmp1),
+                    ("+", tmp2, self.scratch["forest_values_p"], tmp2),
+                ]
+            }
+        )
+        self.emit({"load": [("load", tmp1, tmp1), ("load", tmp2, tmp2)]})
+        self.emit(
+            {"valu": [("vbroadcast", v_tree_1, tmp1), ("vbroadcast", v_tree_2, tmp2)]}
+        )
+        self.emit({"valu": [("-", v_tree_diff, v_tree_2, v_tree_1)]})
+
         self.add("flow", ("pause",))
 
         for vi in range(n_vectors):
@@ -174,9 +218,11 @@ class KernelBuilder:
             self.emit({"load": [("vload", s_val + off, addr_tmp)]})
 
         broadcast_rounds = {0, 11}
+        select_rounds = {1, 12}
 
         for rnd in range(rounds):
             is_broadcast_round = rnd in broadcast_rounds
+            is_select_round = rnd in select_rounds
 
             if is_broadcast_round:
                 self.emit({"load": [("load", tmp1, self.scratch["forest_values_p"])]})
@@ -197,28 +243,59 @@ class KernelBuilder:
                         }
                     )
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        c1, c3 = hash_consts[hi]
-                        self.emit(
-                            {
-                                "valu": [
-                                    (op1, v_tmp1[0], v_val[0], c1),
-                                    (op1, v_tmp1[1], v_val[1], c1),
-                                    (op1, v_tmp1[2], v_val[2], c1),
-                                    (op3, v_tmp2[0], v_val[0], c3),
-                                    (op3, v_tmp2[1], v_val[1], c3),
-                                    (op3, v_tmp2[2], v_val[2], c3),
-                                ]
-                            }
-                        )
-                        self.emit(
-                            {
-                                "valu": [
-                                    (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
-                                    (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
-                                    (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
-                                ]
-                            }
-                        )
+                        hc = hash_consts[hi]
+                        if hc[2]:  # fusable stage
+                            c_factor, c_const = hc[0], hc[1]
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (
+                                            "multiply_add",
+                                            v_val[0],
+                                            v_val[0],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                        (
+                                            "multiply_add",
+                                            v_val[1],
+                                            v_val[1],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                        (
+                                            "multiply_add",
+                                            v_val[2],
+                                            v_val[2],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                    ]
+                                }
+                            )
+                        else:  # non-fusable stage (XOR patterns)
+                            c1, c3 = hc[0], hc[1]
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op1, v_tmp1[0], v_val[0], c1),
+                                        (op1, v_tmp1[1], v_val[1], c1),
+                                        (op1, v_tmp1[2], v_val[2], c1),
+                                        (op3, v_tmp2[0], v_val[0], c3),
+                                        (op3, v_tmp2[1], v_val[1], c3),
+                                        (op3, v_tmp2[2], v_val[2], c3),
+                                    ]
+                                }
+                            )
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
+                                        (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
+                                        (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                    ]
+                                }
+                            )
                     self.emit(
                         {
                             "valu": [
@@ -308,22 +385,42 @@ class KernelBuilder:
                         }
                     )
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        c1, c3 = hash_consts[hi]
-                        ops1 = [
-                            (op1, v_tmp1[i], v_val[i], c1) for i in range(remainder_bc)
-                        ]
-                        ops1 += [
-                            (op3, v_tmp2[i], v_val[i], c3) for i in range(remainder_bc)
-                        ]
-                        self.emit({"valu": ops1})
-                        self.emit(
-                            {
-                                "valu": [
-                                    (op2, v_val[i], v_tmp1[i], v_tmp2[i])
-                                    for i in range(remainder_bc)
-                                ]
-                            }
-                        )
+                        hc = hash_consts[hi]
+                        if hc[2]:  # fusable
+                            c_factor, c_const = hc[0], hc[1]
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (
+                                            "multiply_add",
+                                            v_val[i],
+                                            v_val[i],
+                                            c_factor,
+                                            c_const,
+                                        )
+                                        for i in range(remainder_bc)
+                                    ]
+                                }
+                            )
+                        else:
+                            c1, c3 = hc[0], hc[1]
+                            ops1 = [
+                                (op1, v_tmp1[i], v_val[i], c1)
+                                for i in range(remainder_bc)
+                            ]
+                            ops1 += [
+                                (op3, v_tmp2[i], v_val[i], c3)
+                                for i in range(remainder_bc)
+                            ]
+                            self.emit({"valu": ops1})
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                        for i in range(remainder_bc)
+                                    ]
+                                }
+                            )
                     self.emit(
                         {
                             "valu": [
@@ -379,6 +476,313 @@ class KernelBuilder:
                         for i in range(remainder_bc)
                     ]
                     self.emit({"valu": wb_bc})
+            elif is_select_round:
+                n_triples_sel = n_vectors // 3
+                remainder_sel = n_vectors % 3
+
+                for triple in range(n_triples_sel):
+                    offs = [(triple * 3 + i) * VLEN for i in range(3)]
+                    self.emit(
+                        {
+                            "valu": [
+                                ("-", v_tmp1[0], s_idx + offs[0], v_one),
+                                ("-", v_tmp1[1], s_idx + offs[1], v_one),
+                                ("-", v_tmp1[2], s_idx + offs[2], v_one),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_node[0],
+                                    v_tmp1[0],
+                                    v_tree_diff,
+                                    v_tree_1,
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_node[1],
+                                    v_tmp1[1],
+                                    v_tree_diff,
+                                    v_tree_1,
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_node[2],
+                                    v_tmp1[2],
+                                    v_tree_diff,
+                                    v_tree_1,
+                                ),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("^", v_val[0], s_val + offs[0], v_node[0]),
+                                ("^", v_val[1], s_val + offs[1], v_node[1]),
+                                ("^", v_val[2], s_val + offs[2], v_node[2]),
+                            ]
+                        }
+                    )
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        hc = hash_consts[hi]
+                        if hc[2]:
+                            c_factor, c_const = hc[0], hc[1]
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (
+                                            "multiply_add",
+                                            v_val[0],
+                                            v_val[0],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                        (
+                                            "multiply_add",
+                                            v_val[1],
+                                            v_val[1],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                        (
+                                            "multiply_add",
+                                            v_val[2],
+                                            v_val[2],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                    ]
+                                }
+                            )
+                        else:
+                            c1, c3 = hc[0], hc[1]
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op1, v_tmp1[0], v_val[0], c1),
+                                        (op1, v_tmp1[1], v_val[1], c1),
+                                        (op1, v_tmp1[2], v_val[2], c1),
+                                        (op3, v_tmp2[0], v_val[0], c3),
+                                        (op3, v_tmp2[1], v_val[1], c3),
+                                        (op3, v_tmp2[2], v_val[2], c3),
+                                    ]
+                                }
+                            )
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
+                                        (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
+                                        (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                    ]
+                                }
+                            )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("&", v_tmp1[0], v_val[0], v_one),
+                                ("&", v_tmp1[1], v_val[1], v_one),
+                                ("&", v_tmp1[2], v_val[2], v_one),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", v_tmp2[0], v_one, v_tmp1[0]),
+                                ("+", v_tmp2[1], v_one, v_tmp1[1]),
+                                ("+", v_tmp2[2], v_one, v_tmp1[2]),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_idx[0],
+                                    s_idx + offs[0],
+                                    v_two,
+                                    v_tmp2[0],
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_idx[1],
+                                    s_idx + offs[1],
+                                    v_two,
+                                    v_tmp2[1],
+                                ),
+                                (
+                                    "multiply_add",
+                                    v_idx[2],
+                                    s_idx + offs[2],
+                                    v_two,
+                                    v_tmp2[2],
+                                ),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("<", v_tmp1[0], v_idx[0], v_n_nodes),
+                                ("<", v_tmp1[1], v_idx[1], v_n_nodes),
+                                ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("*", v_idx[0], v_idx[0], v_tmp1[0]),
+                                ("*", v_idx[1], v_idx[1], v_tmp1[1]),
+                                ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_idx + offs[0], v_idx[0], v_zero),
+                                ("+", s_idx + offs[1], v_idx[1], v_zero),
+                                ("+", s_idx + offs[2], v_idx[2], v_zero),
+                                ("+", s_val + offs[0], v_val[0], v_zero),
+                                ("+", s_val + offs[1], v_val[1], v_zero),
+                                ("+", s_val + offs[2], v_val[2], v_zero),
+                            ]
+                        }
+                    )
+
+                if remainder_sel > 0:
+                    offs_sel = [
+                        (n_triples_sel * 3 + i) * VLEN for i in range(remainder_sel)
+                    ]
+                    self.emit(
+                        {
+                            "valu": [
+                                ("-", v_tmp1[i], s_idx + offs_sel[i], v_one)
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_node[i],
+                                    v_tmp1[i],
+                                    v_tree_diff,
+                                    v_tree_1,
+                                )
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("^", v_val[i], s_val + offs_sel[i], v_node[i])
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        hc = hash_consts[hi]
+                        if hc[2]:
+                            c_factor, c_const = hc[0], hc[1]
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (
+                                            "multiply_add",
+                                            v_val[i],
+                                            v_val[i],
+                                            c_factor,
+                                            c_const,
+                                        )
+                                        for i in range(remainder_sel)
+                                    ]
+                                }
+                            )
+                        else:
+                            c1, c3 = hc[0], hc[1]
+                            ops1 = [
+                                (op1, v_tmp1[i], v_val[i], c1)
+                                for i in range(remainder_sel)
+                            ]
+                            ops1 += [
+                                (op3, v_tmp2[i], v_val[i], c3)
+                                for i in range(remainder_sel)
+                            ]
+                            self.emit({"valu": ops1})
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                        for i in range(remainder_sel)
+                                    ]
+                                }
+                            )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("&", v_tmp1[i], v_val[i], v_one)
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", v_tmp2[i], v_one, v_tmp1[i])
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                (
+                                    "multiply_add",
+                                    v_idx[i],
+                                    s_idx + offs_sel[i],
+                                    v_two,
+                                    v_tmp2[i],
+                                )
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
+                                for i in range(remainder_sel)
+                            ]
+                        }
+                    )
+                    wb_sel = [
+                        ("+", s_idx + offs_sel[i], v_idx[i], v_zero)
+                        for i in range(remainder_sel)
+                    ]
+                    wb_sel += [
+                        ("+", s_val + offs_sel[i], v_val[i], v_zero)
+                        for i in range(remainder_sel)
+                    ]
+                    self.emit({"valu": wb_sel})
             else:
                 n_triples = n_vectors // 3
                 remainder = n_vectors % 3
@@ -467,58 +871,104 @@ class KernelBuilder:
                     )
 
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        c1, c3 = hash_consts[hi]
-                        loads = []
-                        for _ in range(2):
-                            if has_next and prefetch_idx < VLEN * next_count:
-                                bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
-                                if bi < next_count:
-                                    loads.append(
-                                        (
-                                            "load_offset",
-                                            v_node_next[bi],
-                                            v_addr_next[bi],
-                                            ei,
+                        hc = hash_consts[hi]
+                        if hc[2]:  # fusable stage
+                            c_factor, c_const = hc[0], hc[1]
+                            loads = []
+                            for _ in range(2):
+                                if has_next and prefetch_idx < VLEN * next_count:
+                                    bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                                    if bi < next_count:
+                                        loads.append(
+                                            (
+                                                "load_offset",
+                                                v_node_next[bi],
+                                                v_addr_next[bi],
+                                                ei,
+                                            )
                                         )
-                                    )
-                                    prefetch_idx += 1
-                        self.emit(
-                            {
-                                "valu": [
-                                    (op1, v_tmp1[0], v_val[0], c1),
-                                    (op1, v_tmp1[1], v_val[1], c1),
-                                    (op1, v_tmp1[2], v_val[2], c1),
-                                    (op3, v_tmp2[0], v_val[0], c3),
-                                    (op3, v_tmp2[1], v_val[1], c3),
-                                    (op3, v_tmp2[2], v_val[2], c3),
-                                ],
-                                **({"load": loads} if loads else {}),
-                            }
-                        )
-                        loads = []
-                        for _ in range(2):
-                            if has_next and prefetch_idx < VLEN * next_count:
-                                bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
-                                if bi < next_count:
-                                    loads.append(
+                                        prefetch_idx += 1
+                            self.emit(
+                                {
+                                    "valu": [
                                         (
-                                            "load_offset",
-                                            v_node_next[bi],
-                                            v_addr_next[bi],
-                                            ei,
+                                            "multiply_add",
+                                            v_val[0],
+                                            v_val[0],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                        (
+                                            "multiply_add",
+                                            v_val[1],
+                                            v_val[1],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                        (
+                                            "multiply_add",
+                                            v_val[2],
+                                            v_val[2],
+                                            c_factor,
+                                            c_const,
+                                        ),
+                                    ],
+                                    **({"load": loads} if loads else {}),
+                                }
+                            )
+                        else:  # non-fusable stage
+                            c1, c3 = hc[0], hc[1]
+                            loads = []
+                            for _ in range(2):
+                                if has_next and prefetch_idx < VLEN * next_count:
+                                    bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                                    if bi < next_count:
+                                        loads.append(
+                                            (
+                                                "load_offset",
+                                                v_node_next[bi],
+                                                v_addr_next[bi],
+                                                ei,
+                                            )
                                         )
-                                    )
-                                    prefetch_idx += 1
-                        self.emit(
-                            {
-                                "valu": [
-                                    (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
-                                    (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
-                                    (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
-                                ],
-                                **({"load": loads} if loads else {}),
-                            }
-                        )
+                                        prefetch_idx += 1
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op1, v_tmp1[0], v_val[0], c1),
+                                        (op1, v_tmp1[1], v_val[1], c1),
+                                        (op1, v_tmp1[2], v_val[2], c1),
+                                        (op3, v_tmp2[0], v_val[0], c3),
+                                        (op3, v_tmp2[1], v_val[1], c3),
+                                        (op3, v_tmp2[2], v_val[2], c3),
+                                    ],
+                                    **({"load": loads} if loads else {}),
+                                }
+                            )
+                            loads = []
+                            for _ in range(2):
+                                if has_next and prefetch_idx < VLEN * next_count:
+                                    bi, ei = prefetch_idx // VLEN, prefetch_idx % VLEN
+                                    if bi < next_count:
+                                        loads.append(
+                                            (
+                                                "load_offset",
+                                                v_node_next[bi],
+                                                v_addr_next[bi],
+                                                ei,
+                                            )
+                                        )
+                                        prefetch_idx += 1
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
+                                        (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
+                                        (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                    ],
+                                    **({"load": loads} if loads else {}),
+                                }
+                            )
 
                     while has_next and prefetch_idx < VLEN * next_count:
                         loads = []
@@ -669,22 +1119,40 @@ class KernelBuilder:
                     )
 
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        c1, c3 = hash_consts[hi]
-                        ops1 = [
-                            (op1, v_tmp1[i], v_val[i], c1) for i in range(remainder)
-                        ]
-                        ops1 += [
-                            (op3, v_tmp2[i], v_val[i], c3) for i in range(remainder)
-                        ]
-                        self.emit({"valu": ops1})
-                        self.emit(
-                            {
-                                "valu": [
-                                    (op2, v_val[i], v_tmp1[i], v_tmp2[i])
-                                    for i in range(remainder)
-                                ]
-                            }
-                        )
+                        hc = hash_consts[hi]
+                        if hc[2]:  # fusable
+                            c_factor, c_const = hc[0], hc[1]
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (
+                                            "multiply_add",
+                                            v_val[i],
+                                            v_val[i],
+                                            c_factor,
+                                            c_const,
+                                        )
+                                        for i in range(remainder)
+                                    ]
+                                }
+                            )
+                        else:
+                            c1, c3 = hc[0], hc[1]
+                            ops1 = [
+                                (op1, v_tmp1[i], v_val[i], c1) for i in range(remainder)
+                            ]
+                            ops1 += [
+                                (op3, v_tmp2[i], v_val[i], c3) for i in range(remainder)
+                            ]
+                            self.emit({"valu": ops1})
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                        for i in range(remainder)
+                                    ]
+                                }
+                            )
 
                     self.emit(
                         {
