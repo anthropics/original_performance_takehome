@@ -168,14 +168,19 @@ class KernelBuilder:
         s_idx = self.alloc_scratch("s_idx", n_vectors * VLEN)
         s_val = self.alloc_scratch("s_val", n_vectors * VLEN)
 
-        v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(3)]
-        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{i}", VLEN) for i in range(3)]
-        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{i}", VLEN) for i in range(3)]
-        v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(3)]
-        v_node = [self.alloc_scratch(f"v_node_{i}", VLEN) for i in range(3)]
-        v_addr = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(3)]
-        v_node_next = [self.alloc_scratch(f"v_node_next_{i}", VLEN) for i in range(3)]
-        v_addr_next = [self.alloc_scratch(f"v_addr_next_{i}", VLEN) for i in range(3)]
+        BATCH = 6
+        v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(BATCH)]
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{i}", VLEN) for i in range(BATCH)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{i}", VLEN) for i in range(BATCH)]
+        v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(BATCH)]
+        v_node = [self.alloc_scratch(f"v_node_{i}", VLEN) for i in range(BATCH)]
+        v_addr = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(BATCH)]
+        v_node_next = [
+            self.alloc_scratch(f"v_node_next_{i}", VLEN) for i in range(BATCH)
+        ]
+        v_addr_next = [
+            self.alloc_scratch(f"v_addr_next_{i}", VLEN) for i in range(BATCH)
+        ]
 
         v_broadcast_node = self.alloc_scratch("v_broadcast_node", VLEN)
         addr_tmp = self.alloc_scratch("addr_tmp")
@@ -228,89 +233,74 @@ class KernelBuilder:
                 self.emit({"load": [("load", tmp1, self.scratch["forest_values_p"])]})
                 self.emit({"valu": [("vbroadcast", v_broadcast_node, tmp1)]})
 
-                n_triples_bc = n_vectors // 3
-                remainder_bc = n_vectors % 3
+                n_batches_bc = n_vectors // BATCH
+                remainder_bc = n_vectors % BATCH
 
-                for triple in range(n_triples_bc):
-                    offs = [(triple * 3 + i) * VLEN for i in range(3)]
+                for batch in range(n_batches_bc):
+                    offs = [(batch * BATCH + i) * VLEN for i in range(BATCH)]
                     self.emit(
                         {
                             "valu": [
-                                ("^", v_val[0], s_val + offs[0], v_broadcast_node),
-                                ("^", v_val[1], s_val + offs[1], v_broadcast_node),
-                                ("^", v_val[2], s_val + offs[2], v_broadcast_node),
+                                ("^", v_val[i], s_val + offs[i], v_broadcast_node)
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                         hc = hash_consts[hi]
-                        if hc[2]:  # fusable stage
+                        if hc[2]:  # fusable
                             c_factor, c_const = hc[0], hc[1]
                             self.emit(
                                 {
                                     "valu": [
                                         (
                                             "multiply_add",
-                                            v_val[0],
-                                            v_val[0],
+                                            v_val[i],
+                                            v_val[i],
                                             c_factor,
                                             c_const,
-                                        ),
-                                        (
-                                            "multiply_add",
-                                            v_val[1],
-                                            v_val[1],
-                                            c_factor,
-                                            c_const,
-                                        ),
-                                        (
-                                            "multiply_add",
-                                            v_val[2],
-                                            v_val[2],
-                                            c_factor,
-                                            c_const,
-                                        ),
+                                        )
+                                        for i in range(BATCH)
                                     ]
                                 }
                             )
-                        else:  # non-fusable stage (XOR patterns)
+                        else:  # non-fusable (12 ops = 2 bundles, then 6 ops = 1 bundle)
                             c1, c3 = hc[0], hc[1]
                             self.emit(
                                 {
                                     "valu": [
-                                        (op1, v_tmp1[0], v_val[0], c1),
-                                        (op1, v_tmp1[1], v_val[1], c1),
-                                        (op1, v_tmp1[2], v_val[2], c1),
-                                        (op3, v_tmp2[0], v_val[0], c3),
-                                        (op3, v_tmp2[1], v_val[1], c3),
-                                        (op3, v_tmp2[2], v_val[2], c3),
+                                        (op1, v_tmp1[i], v_val[i], c1)
+                                        for i in range(BATCH)
                                     ]
                                 }
                             )
                             self.emit(
                                 {
                                     "valu": [
-                                        (op2, v_val[0], v_tmp1[0], v_tmp2[0]),
-                                        (op2, v_val[1], v_tmp1[1], v_tmp2[1]),
-                                        (op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                                        (op3, v_tmp2[i], v_val[i], c3)
+                                        for i in range(BATCH)
+                                    ]
+                                }
+                            )
+                            self.emit(
+                                {
+                                    "valu": [
+                                        (op2, v_val[i], v_tmp1[i], v_tmp2[i])
+                                        for i in range(BATCH)
                                     ]
                                 }
                             )
                     self.emit(
                         {
                             "valu": [
-                                ("&", v_tmp1[0], v_val[0], v_one),
-                                ("&", v_tmp1[1], v_val[1], v_one),
-                                ("&", v_tmp1[2], v_val[2], v_one),
+                                ("&", v_tmp1[i], v_val[i], v_one) for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("+", v_tmp2[0], v_one, v_tmp1[0]),
-                                ("+", v_tmp2[1], v_one, v_tmp1[1]),
-                                ("+", v_tmp2[2], v_one, v_tmp1[2]),
+                                ("+", v_tmp2[i], v_one, v_tmp1[i]) for i in range(BATCH)
                             ]
                         }
                     )
@@ -319,62 +309,51 @@ class KernelBuilder:
                             "valu": [
                                 (
                                     "multiply_add",
-                                    v_idx[0],
-                                    s_idx + offs[0],
+                                    v_idx[i],
+                                    s_idx + offs[i],
                                     v_two,
-                                    v_tmp2[0],
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_idx[1],
-                                    s_idx + offs[1],
-                                    v_two,
-                                    v_tmp2[1],
-                                ),
-                                (
-                                    "multiply_add",
-                                    v_idx[2],
-                                    s_idx + offs[2],
-                                    v_two,
-                                    v_tmp2[2],
-                                ),
+                                    v_tmp2[i],
+                                )
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("<", v_tmp1[0], v_idx[0], v_n_nodes),
-                                ("<", v_tmp1[1], v_idx[1], v_n_nodes),
-                                ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                                ("<", v_tmp1[i], v_idx[i], v_n_nodes)
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("*", v_idx[0], v_idx[0], v_tmp1[0]),
-                                ("*", v_idx[1], v_idx[1], v_tmp1[1]),
-                                ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                                ("*", v_idx[i], v_idx[i], v_tmp1[i])
+                                for i in range(BATCH)
                             ]
                         }
                     )
                     self.emit(
                         {
                             "valu": [
-                                ("+", s_idx + offs[0], v_idx[0], v_zero),
-                                ("+", s_idx + offs[1], v_idx[1], v_zero),
-                                ("+", s_idx + offs[2], v_idx[2], v_zero),
-                                ("+", s_val + offs[0], v_val[0], v_zero),
-                                ("+", s_val + offs[1], v_val[1], v_zero),
-                                ("+", s_val + offs[2], v_val[2], v_zero),
+                                ("+", s_idx + offs[i], v_idx[i], v_zero)
+                                for i in range(BATCH)
+                            ]
+                        }
+                    )
+                    self.emit(
+                        {
+                            "valu": [
+                                ("+", s_val + offs[i], v_val[i], v_zero)
+                                for i in range(BATCH)
                             ]
                         }
                     )
 
                 if remainder_bc > 0:
                     offs_bc = [
-                        (n_triples_bc * 3 + i) * VLEN for i in range(remainder_bc)
+                        (n_batches_bc * BATCH + i) * VLEN for i in range(remainder_bc)
                     ]
                     self.emit(
                         {
