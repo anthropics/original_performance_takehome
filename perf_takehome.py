@@ -587,46 +587,47 @@ class KernelBuilder:
                                     ("valu", (op2, val_vec, ctx["tmp1"], ctx["tmp2"]))
                                 )
 
-                        # Index update
-                        if level == forest_height:
-                            # Wrap to 0 at leaf level
-                            slots.append(("valu", ("+", idx_vec, zero_vec, zero_vec)))
-                        else:
-                            for lane in range(VLEN):
+                        # Index update (skip in final round since indices aren't stored)
+                        if _round < rounds - 1:
+                            if level == forest_height:
+                                # Wrap to 0 at leaf level
+                                slots.append(("valu", ("+", idx_vec, zero_vec, zero_vec)))
+                            else:
+                                for lane in range(VLEN):
+                                    slots.append(
+                                        (
+                                            "alu",
+                                            (
+                                                "&",
+                                                ctx["tmp1"] + lane,
+                                                val_vec + lane,
+                                                one_const,
+                                            ),
+                                        )
+                                    )
+                                    slots.append(
+                                        (
+                                            "alu",
+                                            (
+                                                "+",
+                                                ctx["node"] + lane,
+                                                ctx["tmp1"] + lane,
+                                                one_const,
+                                            ),
+                                        )
+                                    )
                                 slots.append(
                                     (
-                                        "alu",
+                                        "valu",
                                         (
-                                            "&",
-                                            ctx["tmp1"] + lane,
-                                            val_vec + lane,
-                                            one_const,
+                                            "multiply_add",
+                                            idx_vec,
+                                            idx_vec,
+                                            two_vec,
+                                            ctx["node"],
                                         ),
                                     )
                                 )
-                                slots.append(
-                                    (
-                                        "alu",
-                                        (
-                                            "+",
-                                            ctx["node"] + lane,
-                                            ctx["tmp1"] + lane,
-                                            one_const,
-                                        ),
-                                    )
-                                )
-                            slots.append(
-                                (
-                                    "valu",
-                                    (
-                                        "multiply_add",
-                                        idx_vec,
-                                        idx_vec,
-                                        two_vec,
-                                        ctx["node"],
-                                    ),
-                                )
-                            )
 
         # Store final results (only values - indices not checked in tests)
         store_slots = []
