@@ -217,27 +217,21 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        group_size: int = 17, round_tile: int = 13
+        group_size: int = 16
     ):
         """
-        Vectorized kernel with vselect optimization for shallow tree levels.
+        Vectorized kernel with group-based processing for better pipelining.
 
-        Key optimizations:
-        - Preload nodes 0-14 for levels 0-3 (avoids memory loads)
-        - Use vselect for levels 0-3 instead of gather
-        - Keep gather for level 4+ (idx too large for static selection)
-        - multiply_add for hash when applicable
+        Key optimization: Process multiple blocks (group_size) together so that
+        when one block is doing VALU ops, another can do gather loads.
+        This improves utilization of both load (2 slots) and valu (6 slots) engines.
         """
         # Scalar temporaries
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
+        tmp_scalar = self.alloc_scratch("tmp_scalar")
 
-        # Hardcoded benchmark parameters for optimal performance
-        FOREST_VALUES_P = 7
-        INP_INDICES_P = 2054
-        INP_VALUES_P = 2310
-
-        # Initialize variables
+        # Initialize from memory header
         init_vars = [
             "rounds", "n_nodes", "batch_size", "forest_height",
             "forest_values_p", "inp_indices_p", "inp_values_p",
@@ -245,58 +239,31 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        # Pack initialization loads - use hardcoded values
         init_slots = []
-        init_slots.append(("load", ("const", self.scratch["forest_values_p"], FOREST_VALUES_P)))
-        init_slots.append(("load", ("const", self.scratch["inp_indices_p"], INP_INDICES_P)))
-        init_slots.append(("load", ("const", self.scratch["inp_values_p"], INP_VALUES_P)))
+        for i, v in enumerate(init_vars):
+            init_slots.append(("load", ("const", tmp_scalar, i)))
+            init_slots.append(("load", ("load", self.scratch[v], tmp_scalar)))
 
         # Vector constants
         zero_vec = self.scratch_vconst(0, "v_zero", init_slots)
         one_vec = self.scratch_vconst(1, "v_one", init_slots)
         two_vec = self.scratch_vconst(2, "v_two", init_slots)
         one_const = self.scratch_const(1, slots=init_slots)
-        zero_const = self.scratch_const(0, slots=init_slots)
 
         # Broadcast forest_values_p to vector for address calculation
         forest_vec = self.alloc_vec("v_forest_p")
         init_slots.append(("valu", ("vbroadcast", forest_vec, self.scratch["forest_values_p"])))
 
-        # Additional constants for vselect levels
-        three_vec = self.scratch_vconst(3, "v_three", init_slots)
-        four_vec = self.scratch_vconst(4, "v_four", init_slots)
-        seven_vec = self.scratch_vconst(7, "v_seven", init_slots)
+        # Broadcast n_nodes to vector for comparison
+        n_nodes_vec = self.alloc_vec("v_n_nodes")
+        init_slots.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
 
-        # Preload nodes 0-14 for levels 0-3 vselect
-        node_vecs = []
-        PRELOAD_NODES = 15
-        for node_idx in range(PRELOAD_NODES):
-            node_scalar = self.alloc_scratch(f"node_{node_idx}")
-            node_vec = self.alloc_vec(f"v_node_{node_idx}")
-            node_offset = self.scratch_const(node_idx, slots=init_slots)
-            addr_reg = tmp_addr if node_idx % 2 == 0 else tmp_addr2
-            init_slots.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], node_offset)))
-            init_slots.append(("load", ("load", node_scalar, addr_reg)))
-            init_slots.append(("valu", ("vbroadcast", node_vec, node_scalar)))
-            node_vecs.append(node_vec)
-
-        # Hash constants (vectorized) with multiply_add optimization
+        # Hash constants (vectorized)
         hash_vec_consts1 = []
         hash_vec_consts3 = []
-        hash_mul_vecs = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             hash_vec_consts1.append(self.scratch_vconst(val1, slots=init_slots))
             hash_vec_consts3.append(self.scratch_vconst(val3, slots=init_slots))
-            # For patterns like val + const1 + (val << const3), use multiply_add
-            if op1 == "+" and op2 == "+" and op3 == "<<":
-                hash_mul_vecs.append(self.scratch_vconst(1 + (1 << val3), slots=init_slots))
-            else:
-                hash_mul_vecs.append(None)
-
-        # Move vlen_const and offset=0 to init phase (saves 1 cycle)
-        vlen_const = self.scratch_const(VLEN, slots=init_slots)
-        offset = self.alloc_scratch("offset")
-        init_slots.append(("load", ("const", offset, 0)))
 
         # Schedule init phase
         self.instrs.extend(_schedule_slots(init_slots))
@@ -311,18 +278,22 @@ class KernelBuilder:
         val_base = self.alloc_scratch("val_scratch", batch_size)
 
         # Allocate context for each block in a group (separate tmp registers)
+        # This allows interleaved execution without data hazards
         contexts = []
         for g in range(group_size):
             contexts.append({
-                "node": self.alloc_vec(f"ctx_node_{g}"),
-                "tmp1": self.alloc_vec(f"ctx_tmp1_{g}"),
-                "tmp2": self.alloc_vec(f"ctx_tmp2_{g}"),
-                "tmp3": self.alloc_vec(f"ctx_tmp3_{g}"),
+                "node": self.alloc_vec(f"node_{g}"),
+                "tmp1": self.alloc_vec(f"tmp1_{g}"),
+                "tmp2": self.alloc_vec(f"tmp2_{g}"),
             })
 
         slots: list[tuple[str, tuple]] = []
 
         # Load initial idx/val from memory
+        vlen_const = self.scratch_const(VLEN, slots=slots)
+        offset = self.alloc_scratch("offset")
+        slots.append(("load", ("const", offset, 0)))
+
         for block in range(n_blocks):
             # Load idx vector
             slots.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset)))
@@ -333,111 +304,69 @@ class KernelBuilder:
             # Increment offset
             slots.append(("alu", ("+", offset, offset, vlen_const)))
 
-        # Helper function for XOR with node values (scalar ALU for better pipelining)
-        def emit_xor(val_vec: int, node_vec: int) -> None:
-            for lane in range(VLEN):
-                slots.append(("alu", ("^", val_vec + lane, val_vec + lane, node_vec + lane)))
-
-        # Helper to emit one round of computation for a block
-        def emit_round(block: int, gi: int, rnd: int) -> None:
-            ctx = contexts[gi]
-            idx_vec = idx_base + block * VLEN
-            val_vec = val_base + block * VLEN
-            level = rnd % (forest_height + 1)
-
-            # Tree node lookup based on level
-            if level == 0:
-                # Level 0: XOR with preloaded node[0]
-                emit_xor(val_vec, node_vecs[0])
-            elif level == 1:
-                # Level 1: vselect between node[1] and node[2] based on idx & 1
-                slots.append(("valu", ("&", ctx["tmp1"], idx_vec, one_vec)))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp1"], node_vecs[1], node_vecs[2])))
-                emit_xor(val_vec, ctx["node"])
-            elif level == 2:
-                # Level 2: 3 vselects for nodes 3-6
-                # idx ranges 3-6, offset = idx - 3
-                slots.append(("valu", ("-", ctx["tmp1"], idx_vec, three_vec)))
-                slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp1"], one_vec)))
-                slots.append(("valu", ("&", ctx["node"], ctx["tmp1"], two_vec)))
-                slots.append(("flow", ("vselect", ctx["tmp1"], ctx["tmp2"], node_vecs[4], node_vecs[3])))
-                slots.append(("flow", ("vselect", ctx["tmp2"], ctx["tmp2"], node_vecs[6], node_vecs[5])))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["node"], ctx["tmp2"], ctx["tmp1"])))
-                emit_xor(val_vec, ctx["node"])
-            elif level == 3:
-                # Level 3: 7 vselects for nodes 7-14
-                # idx ranges 7-14, offset = idx - 7
-                slots.append(("valu", ("-", ctx["tmp1"], idx_vec, seven_vec)))
-                slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp1"], one_vec)))
-                slots.append(("valu", ("&", ctx["tmp3"], ctx["tmp1"], two_vec)))
-
-                # Select among nodes 7-14 using 3-level binary tree of vselects
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp2"], node_vecs[8], node_vecs[7])))
-                slots.append(("flow", ("vselect", ctx["tmp1"], ctx["tmp2"], node_vecs[10], node_vecs[9])))
-                slots.append(("flow", ("vselect", ctx["tmp1"], ctx["tmp3"], ctx["tmp1"], ctx["node"])))
-
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp2"], node_vecs[12], node_vecs[11])))
-                slots.append(("flow", ("vselect", ctx["tmp2"], ctx["tmp2"], node_vecs[14], node_vecs[13])))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp3"], ctx["tmp2"], ctx["node"])))
-
-                slots.append(("valu", ("-", ctx["tmp2"], idx_vec, seven_vec)))
-                slots.append(("valu", ("&", ctx["tmp2"], ctx["tmp2"], four_vec)))
-                slots.append(("flow", ("vselect", ctx["node"], ctx["tmp2"], ctx["node"], ctx["tmp1"])))
-                emit_xor(val_vec, ctx["node"])
-            else:
-                # Level 4+: gather from memory
-                for lane in range(VLEN):
-                    slots.append(("alu", ("+", ctx["tmp1"] + lane, forest_vec + lane, idx_vec + lane)))
-                for lane in range(VLEN):
-                    slots.append(("load", ("load", ctx["node"] + lane, ctx["tmp1"] + lane)))
-                emit_xor(val_vec, ctx["node"])
-
-            # Hash computation (6 stages) with multiply_add optimization
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                mul_vec = hash_mul_vecs[hi]
-                if mul_vec is not None:
-                    # Use multiply_add: val = val * (1 + 2^shift) + const
-                    slots.append(("valu", ("multiply_add", val_vec, val_vec, mul_vec, hash_vec_consts1[hi])))
-                else:
-                    slots.append(("valu", (op1, ctx["tmp1"], val_vec, hash_vec_consts1[hi])))
-                    slots.append(("valu", (op3, ctx["tmp2"], val_vec, hash_vec_consts3[hi])))
-                    slots.append(("valu", (op2, val_vec, ctx["tmp1"], ctx["tmp2"])))
-
-            # idx = 2*idx + (1 if val%2==0 else 2) = 2*idx + 1 + (val&1 ^ 1)
-            if level == forest_height:
-                # Wrap to 0 at leaf level
-                slots.append(("valu", ("+", idx_vec, zero_vec, zero_vec)))
-            else:
-                # Use scalar ALU for better pipelining
-                for lane in range(VLEN):
-                    slots.append(("alu", ("&", ctx["tmp1"] + lane, val_vec + lane, one_const)))
-                    slots.append(("alu", ("+", ctx["node"] + lane, ctx["tmp1"] + lane, one_const)))
-                # idx = idx * 2 + increment
-                slots.append(("valu", ("multiply_add", idx_vec, idx_vec, two_vec, ctx["node"])))
-
-        # Helper to emit store for a block (using direct address calculation)
-        def emit_store(block: int) -> None:
-            store_addr = self.scratch_const(block * VLEN, slots=slots)
-            slots.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], store_addr)))
-            slots.append(("store", ("vstore", tmp_addr, val_base + block * VLEN)))
-
-        # Process blocks in groups with round tiling
+        # Process blocks in groups for better interleaving
         for group_start in range(0, n_blocks, group_size):
-            for round_start in range(0, rounds, round_tile):
-                round_end = min(rounds, round_start + round_tile)
+            group_end = min(group_start + group_size, n_blocks)
+            actual_group_size = group_end - group_start
 
-                # Compute this tile for all blocks in group
-                for gi in range(group_size):
+            # Process all rounds for this group, interleaving blocks
+            for rnd in range(rounds):
+                # Generate operations for all blocks in group
+                for gi in range(actual_group_size):
                     block = group_start + gi
-                    if block >= n_blocks:
-                        break
+                    ctx = contexts[gi]
+                    idx_vec = idx_base + block * VLEN
+                    val_vec = val_base + block * VLEN
 
-                    for rnd in range(round_start, round_end):
-                        emit_round(block, gi, rnd)
+                    # Gather node values: compute addresses
+                    for lane in range(VLEN):
+                        slots.append(("alu", ("+", ctx["tmp1"] + lane, forest_vec + lane, idx_vec + lane)))
 
-        # Store all blocks at the end (matches reference implementation)
+                # Interleaved loads - all blocks' gathers together
+                for gi in range(actual_group_size):
+                    block = group_start + gi
+                    ctx = contexts[gi]
+                    for lane in range(VLEN):
+                        slots.append(("load", ("load", ctx["node"] + lane, ctx["tmp1"] + lane)))
+
+                # VALU operations for all blocks (can overlap with next group's loads)
+                for gi in range(actual_group_size):
+                    block = group_start + gi
+                    ctx = contexts[gi]
+                    idx_vec = idx_base + block * VLEN
+                    val_vec = val_base + block * VLEN
+
+                    # val = val ^ node_val
+                    slots.append(("valu", ("^", val_vec, val_vec, ctx["node"])))
+
+                    # Hash computation (6 stages)
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        slots.append(("valu", (op1, ctx["tmp1"], val_vec, hash_vec_consts1[hi])))
+                        slots.append(("valu", (op3, ctx["tmp2"], val_vec, hash_vec_consts3[hi])))
+                        slots.append(("valu", (op2, val_vec, ctx["tmp1"], ctx["tmp2"])))
+
+                    # idx = 2*idx + (1 if val%2==0 else 2)
+                    slots.append(("valu", ("&", ctx["tmp1"], val_vec, one_vec)))
+                    slots.append(("valu", ("==", ctx["tmp1"], ctx["tmp1"], zero_vec)))
+                    slots.append(("flow", ("vselect", ctx["tmp2"], ctx["tmp1"], one_vec, two_vec)))
+                    slots.append(("valu", ("*", idx_vec, idx_vec, two_vec)))
+                    slots.append(("valu", ("+", idx_vec, idx_vec, ctx["tmp2"])))
+
+                    # idx = 0 if idx >= n_nodes else idx
+                    slots.append(("valu", ("<", ctx["tmp1"], idx_vec, n_nodes_vec)))
+                    slots.append(("flow", ("vselect", idx_vec, ctx["tmp1"], idx_vec, zero_vec)))
+
+        # Store final results
+        slots.append(("load", ("const", offset, 0)))
         for block in range(n_blocks):
-            emit_store(block)
+            # Store val vector
+            slots.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], offset)))
+            slots.append(("store", ("vstore", tmp_addr, val_base + block * VLEN)))
+            # Store idx vector
+            slots.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], offset)))
+            slots.append(("store", ("vstore", tmp_addr, idx_base + block * VLEN)))
+            # Increment offset
+            slots.append(("alu", ("+", offset, offset, vlen_const)))
 
         # Schedule all body operations
         self.instrs.extend(_schedule_slots(slots))
