@@ -40,7 +40,7 @@ from problem import (
 
 
 # ============================================================================
-# Dependency Graph and Instruction Scheduler
+# Dependency Graph and Instruction Scheduler (CSR-based)
 # ============================================================================
 
 @dataclass
@@ -53,12 +53,50 @@ class InstrNode:
     writes: set = field(default_factory=set)
     batch_item: int = 0
     round_num: int = 0
-    in_degree: int = 0
-    successors: list = field(default_factory=list)
+
+
+class CSRGraph:
+    """Dense ID + CSR adjacency graph for efficient scheduling."""
+
+    def __init__(self, n_nodes: int):
+        self.n = n_nodes
+        self.nodes: list[InstrNode] = [None] * n_nodes
+        # CSR representation: edge_ptr[i] to edge_ptr[i+1] gives successors of i
+        self.edge_lists: list[list[int]] = [[] for _ in range(n_nodes)]
+        self.in_degree: list[int] = [0] * n_nodes
+
+    def set_node(self, node: InstrNode) -> None:
+        self.nodes[node.id] = node
+
+    def add_edge(self, from_id: int, to_id: int) -> None:
+        if to_id not in self.edge_lists[from_id]:
+            self.edge_lists[from_id].append(to_id)
+            self.in_degree[to_id] += 1
+
+    def finalize_csr(self):
+        """Convert to true CSR format for faster iteration."""
+        self.edge_ptr = [0] * (self.n + 1)
+        total_edges = sum(len(e) for e in self.edge_lists)
+        self.edge_data = [0] * total_edges
+
+        ptr = 0
+        for i in range(self.n):
+            self.edge_ptr[i] = ptr
+            for succ in self.edge_lists[i]:
+                self.edge_data[ptr] = succ
+                ptr += 1
+        self.edge_ptr[self.n] = ptr
+        self.edge_lists = None  # Free memory
+
+    def successors(self, node_id: int):
+        """Iterate successors of a node (works with both formats)."""
+        if self.edge_lists is not None:
+            return self.edge_lists[node_id]
+        return self.edge_data[self.edge_ptr[node_id]:self.edge_ptr[node_id + 1]]
 
 
 class DependencyGraph:
-    """DAG of instruction dependencies with Kahn's algorithm."""
+    """DAG of instruction dependencies with Kahn's algorithm (legacy wrapper)."""
 
     def __init__(self):
         self.nodes: dict[int, InstrNode] = {}
@@ -67,12 +105,16 @@ class DependencyGraph:
         self.nodes[node.id] = node
 
     def add_edge(self, from_id: int, to_id: int) -> None:
+        if not hasattr(self.nodes[from_id], 'successors'):
+            self.nodes[from_id].successors = []
+        if not hasattr(self.nodes[to_id], 'in_degree'):
+            self.nodes[to_id].in_degree = 0
         if to_id not in self.nodes[from_id].successors:
             self.nodes[from_id].successors.append(to_id)
-            self.nodes[to_id].in_degree += 1
+            self.nodes[to_id].in_degree = getattr(self.nodes[to_id], 'in_degree', 0) + 1
 
     def topo_sort_kahn(self) -> list[list[int]]:
-        in_degree = {nid: node.in_degree for nid, node in self.nodes.items()}
+        in_degree = {nid: getattr(node, 'in_degree', 0) for nid, node in self.nodes.items()}
         ready = [nid for nid, deg in in_degree.items() if deg == 0]
         levels = []
 
@@ -80,7 +122,7 @@ class DependencyGraph:
             levels.append(ready)
             next_ready = []
             for nid in ready:
-                for succ in self.nodes[nid].successors:
+                for succ in getattr(self.nodes[nid], 'successors', []):
                     in_degree[succ] -= 1
                     if in_degree[succ] == 0:
                         next_ready.append(succ)
@@ -199,6 +241,285 @@ def build_dependency_graph(instructions: list[tuple]) -> DependencyGraph:
                 last_readers[addr].append(i)
 
     return graph
+
+
+def build_csr_graph(instructions: list[tuple], add_stagger: bool = True) -> CSRGraph:
+    """Build CSR dependency graph from tagged instructions."""
+    n = len(instructions)
+    graph = CSRGraph(n)
+    last_writer: dict[int, int] = {}
+    last_readers: dict[int, list[int]] = defaultdict(list)
+
+    for i, (engine, slot, batch_item, round_num) in enumerate(instructions):
+        reads, writes = extract_reads_writes(engine, slot)
+        node = InstrNode(id=i, engine=engine, slot=slot, reads=reads, writes=writes,
+                        batch_item=batch_item, round_num=round_num)
+        graph.set_node(node)
+
+        # RAW
+        for addr in reads:
+            if addr in last_writer:
+                graph.add_edge(last_writer[addr], i)
+
+        # WAW
+        for addr in writes:
+            if addr in last_writer:
+                graph.add_edge(last_writer[addr], i)
+
+        # WAR
+        for addr in writes:
+            for reader_id in last_readers[addr]:
+                if reader_id != last_writer.get(addr):
+                    graph.add_edge(reader_id, i)
+
+        for addr in writes:
+            last_writer[addr] = i
+            last_readers[addr] = []
+        for addr in reads:
+            if i not in last_readers[addr]:
+                last_readers[addr].append(i)
+
+    # Add stagger dependencies before finalization
+    if add_stagger:
+        add_stagger_deps_csr(graph, wave_size=8)
+
+    graph.finalize_csr()
+    return graph
+
+
+def add_stagger_deps_csr(graph: CSRGraph, wave_size: int = 8):
+    """Add stagger dependencies to CSR graph for software pipelining."""
+    by_item_round = defaultdict(list)
+    for nid in range(graph.n):
+        node = graph.nodes[nid]
+        if node.engine != "debug":
+            by_item_round[(node.batch_item, node.round_num)].append(node)
+
+    for key in by_item_round:
+        by_item_round[key].sort(key=lambda n: n.id)
+
+    first_node = {}
+    for key, nodes in by_item_round.items():
+        if nodes:
+            first_node[key] = nodes[0]
+
+    items = sorted(set(k[0] for k in by_item_round.keys()))
+    rounds = sorted(set(k[1] for k in by_item_round.keys()))
+
+    # Within-round stagger: wave K+1 depends on wave K
+    for round_num in rounds:
+        for item in items:
+            wave = item // wave_size
+            if wave > 0:
+                prev_item = (wave - 1) * wave_size
+                key_curr = (item, round_num)
+                key_prev = (prev_item, round_num)
+                if key_curr in first_node and key_prev in first_node:
+                    # Need to add edge - but CSR is finalized, so rebuild in_degree
+                    from_id = first_node[key_prev].id
+                    to_id = first_node[key_curr].id
+                    if graph.edge_lists is None:
+                        # CSR already finalized, update in_degree only
+                        graph.in_degree[to_id] += 1
+                    else:
+                        graph.add_edge(from_id, to_id)
+
+
+def pack_with_local_queues(graph: CSRGraph, broadcast_state: dict) -> list[dict]:
+    """Pack using priority-based scheduling for better interleaving."""
+    bundles = []
+    broadcast_cache = broadcast_state['cache']
+    broadcast_ptr = broadcast_state['ptr']
+
+    n = graph.n
+    in_degree = graph.in_degree.copy()
+    completed = [False] * n
+
+    # Ready queues by engine type for faster access
+    ready_by_engine = {
+        "load": [],
+        "alu": [],
+        "valu": [],
+        "store": [],
+        "flow": [],
+        "debug": []
+    }
+
+    def make_ready(nid):
+        """Mark successors as potentially ready."""
+        for succ in graph.successors(nid):
+            in_degree[succ] -= 1
+            if in_degree[succ] == 0:
+                snode = graph.nodes[succ]
+                ready_by_engine[snode.engine].append(snode)
+
+    # Initialize ready queues
+    for nid in range(n):
+        if in_degree[nid] == 0:
+            node = graph.nodes[nid]
+            ready_by_engine[node.engine].append(node)
+
+    # Pending vectorization state - separate FMA (must vectorize) from regular ALU
+    pending_alu = []  # Regular ALU ops
+    pending_fma = []  # FMA ops (must be vectorized)
+
+    def try_vectorize():
+        """Try to vectorize pending ALU and FMA ops."""
+        nonlocal broadcast_ptr
+        valu_slots = []
+        pre_broadcasts = []
+
+        # FMA must be vectorized - group by operation
+        fma_by_dest = sorted(pending_fma, key=lambda n: n.slot[1])
+        remaining_fma = []
+        i = 0
+        while i < len(fma_by_dest):
+            if i + VLEN <= len(fma_by_dest):
+                group = fma_by_dest[i:i+VLEN]
+                dests = sorted(n.slot[1] for n in group)
+                if dests == list(range(dests[0], dests[0] + VLEN)):
+                    nodes_by_dest = sorted(group, key=lambda n: n.slot[1])
+                    dest_base = nodes_by_dest[0].slot[1]
+                    src_a_base = nodes_by_dest[0].slot[2]
+                    src_b = nodes_by_dest[0].slot[3]
+                    src_c = nodes_by_dest[0].slot[4]
+
+                    if all(n.slot[3] == src_b for n in group):
+                        if src_b not in broadcast_cache:
+                            vec_addr = broadcast_ptr
+                            broadcast_ptr += VLEN
+                            broadcast_cache[src_b] = vec_addr
+                            pre_broadcasts.append(("vbroadcast", vec_addr, src_b))
+                        src_b = broadcast_cache[src_b]
+
+                    if all(n.slot[4] == src_c for n in group):
+                        if src_c not in broadcast_cache:
+                            vec_addr = broadcast_ptr
+                            broadcast_ptr += VLEN
+                            broadcast_cache[src_c] = vec_addr
+                            pre_broadcasts.append(("vbroadcast", vec_addr, src_c))
+                        src_c = broadcast_cache[src_c]
+
+                    valu_slots.append((("multiply_add", dest_base, src_a_base, src_b, src_c), [n.id for n in group]))
+                    i += VLEN
+                    continue
+            remaining_fma.append(fma_by_dest[i])
+            i += 1
+
+        # Regular ALU vectorization
+        by_op = defaultdict(list)
+        for node in pending_alu:
+            by_op[node.slot[0]].append(node)
+
+        remaining_alu = []
+        for op, nodes in by_op.items():
+            nodes_sorted = sorted(nodes, key=lambda n: n.slot[1])
+            i = 0
+            while i < len(nodes_sorted):
+                if i + VLEN <= len(nodes_sorted):
+                    group = nodes_sorted[i:i+VLEN]
+                    dests = sorted(n.slot[1] for n in group)
+                    if dests == list(range(dests[0], dests[0] + VLEN)):
+                        nodes_by_dest = sorted(group, key=lambda n: n.slot[1])
+                        dest_base = nodes_by_dest[0].slot[1]
+                        src1_base = nodes_by_dest[0].slot[2]
+                        src2_base = nodes_by_dest[0].slot[3]
+
+                        if all(n.slot[2] == src1_base for n in group):
+                            if src1_base not in broadcast_cache:
+                                vec_addr = broadcast_ptr
+                                broadcast_ptr += VLEN
+                                broadcast_cache[src1_base] = vec_addr
+                                pre_broadcasts.append(("vbroadcast", vec_addr, src1_base))
+                            src1_base = broadcast_cache[src1_base]
+
+                        if all(n.slot[3] == src2_base for n in group):
+                            if src2_base not in broadcast_cache:
+                                vec_addr = broadcast_ptr
+                                broadcast_ptr += VLEN
+                                broadcast_cache[src2_base] = vec_addr
+                                pre_broadcasts.append(("vbroadcast", vec_addr, src2_base))
+                            src2_base = broadcast_cache[src2_base]
+
+                        valu_slots.append(((op, dest_base, src1_base, src2_base), [n.id for n in group]))
+                        i += VLEN
+                        continue
+
+                remaining_alu.append(nodes_sorted[i])
+                i += 1
+
+        return pre_broadcasts, valu_slots, remaining_alu, remaining_fma
+
+    def has_work():
+        return any(ready_by_engine.values()) or pending_alu or pending_fma
+
+    while has_work():
+        bundle = {}
+        bundle_nodes = []
+
+        # Move ready ALU to pending, separating FMA
+        for node in ready_by_engine["alu"]:
+            if node.slot[0] == "fma":
+                pending_fma.append(node)
+            else:
+                pending_alu.append(node)
+        ready_by_engine["alu"] = []
+
+        # Try to vectorize
+        pre_broadcasts, valu_slots, remaining_alu, remaining_fma = try_vectorize()
+        pending_alu = remaining_alu
+        pending_fma = remaining_fma
+
+        # Emit broadcasts first if needed
+        if pre_broadcasts:
+            for bi in range(0, len(pre_broadcasts), SLOT_LIMITS["valu"]):
+                batch = pre_broadcasts[bi:bi+SLOT_LIMITS["valu"]]
+                bundles.append({"valu": batch})
+
+        # Add vectorized ops to valu queue
+        for valu_slot, node_ids in valu_slots:
+            ready_by_engine["valu"].append((valu_slot, node_ids))
+
+        # Pack a bundle - try valu first to keep vectorized work moving
+        for engine in ["valu", "load", "store", "flow", "alu", "debug"]:
+            if ready_by_engine.get(engine):
+                limit = SLOT_LIMITS.get(engine, 1)
+                take = min(limit, len(ready_by_engine[engine]))
+                taken = []
+                for _ in range(take):
+                    item = ready_by_engine[engine].pop(0)
+                    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], list):
+                        taken.append(item[0])
+                        bundle_nodes.extend(item[1])
+                    else:
+                        taken.append(item.slot)
+                        bundle_nodes.append(item.id)
+                if taken:
+                    bundle[engine] = taken
+
+        # Also take from pending_alu to fill ALU slots
+        if pending_alu and "alu" not in bundle:
+            limit = SLOT_LIMITS.get("alu", 12)
+            take = min(limit, len(pending_alu))
+            taken = []
+            for _ in range(take):
+                item = pending_alu.pop(0)
+                taken.append(item.slot)
+                bundle_nodes.append(item.id)
+            if taken:
+                bundle["alu"] = taken
+
+        if bundle:
+            bundles.append(bundle)
+            # Update ready state
+            for nid in bundle_nodes:
+                completed[nid] = True
+                make_ready(nid)
+        else:
+            break
+
+    broadcast_state['ptr'] = broadcast_ptr
+    return bundles
 
 
 def add_stagger_dependencies(graph: DependencyGraph, wave_size: int = 8):
@@ -580,9 +901,9 @@ class KernelBuilder:
                         group_body.append(("alu", ("<", bs["hash_tmp"], bs["tmp_idx"], self.scratch["n_nodes"]), item, round_num))
                         group_body.append(("alu", ("*", bs["tmp_idx"], bs["tmp_idx"], bs["hash_tmp"]), item, round_num))
 
-            graph = build_dependency_graph(group_body)
-            levels = graph.topo_sort_kahn()
-            instrs = pack_levels_into_bundles(graph, levels, broadcast_state)
+            # Use CSR graph with local queues for better interleaving
+            graph = build_csr_graph(group_body)
+            instrs = pack_with_local_queues(graph, broadcast_state)
             tagged_body.extend(instrs)
 
             # Store results
