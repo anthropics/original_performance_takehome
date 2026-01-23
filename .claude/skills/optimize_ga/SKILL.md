@@ -58,14 +58,8 @@ loop:
    - If output contains `TASK:` lines → extract all tasks
 
 3. **Launch ALL agents in parallel** (CRITICAL - one message with all Task calls):
-   - For `TASK: crossover ga CAND_P1 CAND_P2 CAND_CHILD`:
-     ```
-     Task(crossover, "ga CAND_P1 CAND_P2 CAND_CHILD")
-     ```
-   - For `TASK: mutate ga CAND_PARENT CAND_CHILD`:
-     ```
-     Task(mutate, "ga CAND_PARENT CAND_CHILD")
-     ```
+   - For each `TASK: crossover ...` line → `Task(crossover, args)` where args is everything after "TASK: crossover "
+   - For each `TASK: mutate ...` line → `Task(mutate, args)` where args is everything after "TASK: mutate "
 
 4. **Wait for all agents to complete**, then **repeat** from step 1
 
