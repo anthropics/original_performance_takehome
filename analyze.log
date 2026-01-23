@@ -1,0 +1,355 @@
+
+Level 0:
+  VALU: 13, ALU: 24, Load: 0, Flow: 0
+
+Level 1:
+  VALU: 14, ALU: 24, Load: 0, Flow: 1
+
+Level 2:
+  VALU: 16, ALU: 24, Load: 0, Flow: 3
+
+Level 3:
+  VALU: 18, ALU: 24, Load: 0, Flow: 7
+
+Level 4:
+  VALU: 13, ALU: 32, Load: 8, Flow: 0
+
+Level 5:
+  VALU: 13, ALU: 32, Load: 8, Flow: 0
+
+Level 6:
+  VALU: 13, ALU: 32, Load: 8, Flow: 0
+
+Level 7:
+  VALU: 13, ALU: 32, Load: 8, Flow: 0
+
+Level 8:
+  VALU: 13, ALU: 32, Load: 8, Flow: 0
+
+Level 9:
+  VALU: 13, ALU: 32, Load: 8, Flow: 0
+
+Level 10:
+  VALU: 13, ALU: 16, Load: 8, Flow: 0
+
+----------------------------------------
+LEVEL FREQUENCY IN 16 ROUNDS:
+----------------------------------------
+Level 0: 2 times
+Level 1: 2 times
+Level 2: 2 times
+Level 3: 2 times
+Level 4: 2 times
+Level 5: 1 times
+Level 6: 1 times
+Level 7: 1 times
+Level 8: 1 times
+Level 9: 1 times
+Level 10: 1 times
+
+============================================================
+HASH DEPENDENCY CHAIN ANALYSIS
+============================================================
+
+HASH_STAGES:
+  Stage 0: +   7ed55d16, +, << 12 -> multiply_add
+  Stage 1: ^   c761c23c, ^, >> 19 -> 3 ops
+  Stage 2: +   165667b1, +, << 5 -> multiply_add
+  Stage 3: +   d3a2646c, ^, << 9 -> 3 ops
+  Stage 4: +   fd7046c5, +, << 3 -> multiply_add
+  Stage 5: ^   b55a4f09, ^, >> 16 -> 3 ops
+
+Multiply_add stages: 3
+3-op stages: 3
+Total VALU ops per hash: 12
+
+Dependency chain per hash:
+  val -> stage0 -> stage1 -> ... -> stage5 -> val'
+  This is a 6-deep dependency chain!
+  With multiply_add: some stages are 1 VALU op
+  Without: stage needs 3 VALU ops but tmp1/tmp2 can overlap
+
+============================================================
+IDEAL CYCLE ESTIMATION
+============================================================
+
+Total operations (body only):
+  VALU: 7232
+  ALU:  13824
+  Load: 2112
+  Store: 32
+  Flow: 704
+
+Ideal cycles per engine (no dependencies):
+  VALU: 1205.3 cycles (6 slots)
+  ALU:  1152.0 cycles (12 slots)
+  Load: 1056.0 cycles (2 slots)
+  Store: 16.0 cycles (2 slots)
+  Flow: 704.0 cycles (1 slots)
+
+Bottleneck: VALU (1205.3 cycles)
+Current actual: 1307 cycles
+Efficiency: 92.2%
+
+
+============================================================
+SCHEDULER ANALYSIS
+============================================================
+
+Total cycles: 1307
+
+Slot limits: {'alu': 12, 'valu': 6, 'load': 2, 'store': 2, 'flow': 1, 'debug': 64}
+
+----------------------------------------
+ENGINE UTILIZATION:
+----------------------------------------
+
+ALU (limit=12):
+  Total ops: 13967
+  Cycles with ops: 1255
+  Avg ops/cycle: 11.13
+  Utilization: 92.7% (of max possible)
+  Distribution: {1: 18, 2: 37, 3: 2, 4: 8, 5: 3, 6: 10, 7: 4, 8: 43, 9: 12, 10: 64, 11: 6, 12: 1048}
+
+VALU (limit=6):
+  Total ops: 7267
+  Cycles with ops: 1296
+  Avg ops/cycle: 5.61
+  Utilization: 93.5% (of max possible)
+  Distribution: {1: 33, 2: 36, 3: 32, 4: 32, 5: 40, 6: 1123}
+
+LOAD (limit=2):
+  Total ops: 2185
+  Cycles with ops: 1111
+  Avg ops/cycle: 1.97
+  Utilization: 98.3% (of max possible)
+  Distribution: {1: 37, 2: 1074}
+
+STORE (limit=2):
+  Total ops: 32
+  Cycles with ops: 32
+  Avg ops/cycle: 1.00
+  Utilization: 50.0% (of max possible)
+  Distribution: {1: 32}
+
+FLOW (limit=1):
+  Total ops: 704
+  Cycles with ops: 704
+  Avg ops/cycle: 1.00
+  Utilization: 100.0% (of max possible)
+  Distribution: {1: 704}
+
+============================================================
+FLOW/VALU OVERLAP ANALYSIS
+============================================================
+
+Cycle categorization:
+  Flow only (VALU=0): 0 cycles
+  VALU only (Flow=0): 592 cycles
+  Both Flow+VALU: 704 cycles
+    - VALU underutilized (<6): 80
+    - VALU full (=6): 624
+  Neither: 9 cycles
+
+Total cycles with Flow: 704
+Wasted VALU slots when Flow active: 240 (approx)
+
+----------------------------------------
+SAMPLE: First 20 cycles with Flow ops
+----------------------------------------
+  Cycle   41: Flow=1, VALU=5, ALU=12, Load=2
+  Cycle   43: Flow=1, VALU=4, ALU=12, Load=2
+  Cycle   46: Flow=1, VALU=4, ALU=12, Load=2
+  Cycle   49: Flow=1, VALU=6, ALU=12, Load=2
+  Cycle   51: Flow=1, VALU=6, ALU=12, Load=2
+  Cycle   57: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   58: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   59: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   60: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   61: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   62: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   63: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   64: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   65: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   66: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   67: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   68: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   69: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   71: Flow=1, VALU=6, ALU=12, Load=1
+  Cycle   73: Flow=1, VALU=6, ALU=12, Load=1
+
+----------------------------------------
+CONSECUTIVE FLOW CYCLES (potential bottleneck)
+----------------------------------------
+  Max consecutive Flow cycles: 47
+  Avg consecutive Flow cycles: 7.2
+  Number of Flow runs: 98
+  Distribution of run lengths: {1: 40, 2: 1, 3: 11, 4: 4, 6: 9, 7: 6, 8: 1, 9: 2, 10: 1, 11: 1, 13: 4, 14: 3, 15: 1, 16: 1, 17: 1, 18: 1, 21: 2, 23: 2, 24: 2, 27: 2, 30: 1, 43: 1, 47: 1}
+
+============================================================
+DEPENDENCY STALL ANALYSIS
+============================================================
+
+Cycles with VALU underutilization (0 < ops < 6): 173
+
+Other engine activity in VALU-underutilized cycles:
+  alu: 139 cycles
+  flow: 80 cycles
+  load: 115 cycles
+  store: 5 cycles
+
+Distribution of VALU underutilization:
+  Init phase (cycles 0-23): 22 cycles
+  Body phase (cycles 24-1307): 151 cycles
+
+  Body breakdown:
+    Early (first 100 cycles): 17
+    Middle: 61
+    Late (last 100 cycles): 73
+
+Sample of VALU-underutilized cycles:
+  Cycle 1: VALU=1, active engines: ['valu', 'load']
+  Cycle 2: VALU=1, active engines: ['alu', 'valu', 'load']
+  Cycle 3: VALU=2, active engines: ['alu', 'valu', 'load']
+  Cycle 4: VALU=2, active engines: ['alu', 'valu', 'load']
+  Cycle 5: VALU=2, active engines: ['alu', 'valu', 'load']
+  Cycle 6: VALU=2, active engines: ['valu', 'load']
+  Cycle 7: VALU=2, active engines: ['valu', 'load']
+  Cycle 8: VALU=1, active engines: ['alu', 'valu', 'load']
+  Cycle 9: VALU=1, active engines: ['alu', 'valu', 'load']
+  Cycle 10: VALU=2, active engines: ['alu', 'valu', 'load']
+
+============================================================
+VALU SATURATION GAP ANALYSIS
+============================================================
+
+Total gaps (consecutive VALU < 6): 29
+Significant gaps (length > 3): 12
+
+Largest gaps:
+  Cycles 1250-1306: length=57, avg VALU=1.9
+  Cycles 466-477: length=12, avg VALU=3.6
+  Cycles 24-34: length=11, avg VALU=1.9
+  Cycles 38-47: length=10, avg VALU=4.8
+  Cycles 834-843: length=10, avg VALU=3.0
+
+Total wasted VALU slots in body: 466
+Equivalent to: 77.7 cycles of VALU work
+
+============================================================
+TAIL REGION ANALYSIS (Cycles 1250-1306)
+============================================================
+
+Tail region: cycles 1247 to 1306
+
+Per-cycle breakdown:
+----------------------------------------------------------------------
+ Cycle | VALU |  ALU | Load | Store | Flow | Notes
+----------------------------------------------------------------------
+  1247 |    4 |    8 |    0 |     0 |    0 | valu_partial
+  1248 |    6 |    0 |    2 |     0 |    0 | gather, VALU_FULL
+  1249 |    6 |    2 |    2 |     0 |    0 | gather, VALU_FULL
+  1250 |    3 |   10 |    2 |     0 |    0 | gather, valu_partial
+  1251 |    3 |   12 |    2 |     1 |    0 | STORE, gather, valu_partial
+  1252 |    3 |   12 |    0 |     0 |    0 | valu_partial
+  1253 |    4 |    5 |    0 |     0 |    0 | valu_partial
+  1254 |    5 |    8 |    0 |     0 |    0 | valu_partial
+  1255 |    2 |   12 |    0 |     0 |    0 | valu_partial
+  1256 |    1 |   12 |    2 |     0 |    0 | gather, valu_partial
+  1257 |    3 |   10 |    2 |     0 |    0 | gather, valu_partial
+  1258 |    3 |    2 |    2 |     0 |    0 | gather, valu_partial
+  1259 |    4 |    2 |    2 |     0 |    0 | gather, valu_partial
+  1260 |    4 |    2 |    0 |     0 |    1 | vselect, valu_partial
+  1261 |    2 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1262 |    2 |    9 |    0 |     1 |    1 | STORE, vselect, valu_partial
+  1263 |    1 |    8 |    0 |     0 |    1 | vselect, valu_partial
+  1264 |    2 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1265 |    3 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1266 |    2 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1267 |    1 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1268 |    2 |    8 |    0 |     0 |    1 | vselect, valu_partial
+  1269 |    2 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1270 |    2 |    9 |    0 |     1 |    1 | STORE, vselect, valu_partial
+  1271 |    1 |    8 |    0 |     0 |    1 | vselect, valu_partial
+  1272 |    3 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1273 |    3 |    0 |    0 |     0 |    0 | valu_partial
+  1274 |    1 |    0 |    0 |     0 |    1 | vselect, valu_partial
+  1275 |    1 |    8 |    0 |     0 |    0 | valu_partial
+  1276 |    3 |    0 |    0 |     0 |    0 | valu_partial
+  1277 |    3 |    0 |    0 |     0 |    0 | valu_partial
+  1278 |    1 |    8 |    0 |     0 |    0 | valu_partial
+  1279 |    1 |    8 |    0 |     0 |    0 | valu_partial
+  1280 |    3 |    0 |    0 |     0 |    0 | valu_partial
+  1281 |    1 |    8 |    0 |     0 |    0 | valu_partial
+  1282 |    1 |    0 |    2 |     0 |    0 | gather, valu_partial
+  1283 |    2 |    2 |    2 |     0 |    0 | gather, valu_partial
+  1284 |    1 |    2 |    2 |     0 |    0 | gather, valu_partial
+  1285 |    0 |   10 |    2 |     0 |    0 | gather
+  1286 |    0 |   10 |    0 |     0 |    0 | 
+  1287 |    2 |    0 |    0 |     0 |    0 | valu_partial
+  1288 |    2 |    8 |    0 |     0 |    0 | valu_partial
+  1289 |    1 |    0 |    2 |     0 |    0 | gather, valu_partial
+  1290 |    1 |    2 |    2 |     0 |    0 | gather, valu_partial
+  1291 |    2 |    2 |    2 |     0 |    0 | gather, valu_partial
+  1292 |    1 |    2 |    2 |     0 |    0 | gather, valu_partial
+  1293 |    1 |    2 |    0 |     0 |    0 | valu_partial
+  1294 |    3 |    0 |    0 |     0 |    0 | valu_partial
+  1295 |    3 |    0 |    0 |     0 |    0 | valu_partial
+  1296 |    1 |    9 |    0 |     1 |    0 | STORE, valu_partial
+  1297 |    1 |    8 |    0 |     0 |    0 | valu_partial
+  1298 |    3 |    0 |    0 |     0 |    0 | valu_partial
+  1299 |    1 |    0 |    0 |     0 |    0 | valu_partial
+  1300 |    1 |    0 |    0 |     0 |    0 | valu_partial
+  1301 |    2 |    0 |    0 |     0 |    0 | valu_partial
+  1302 |    1 |    0 |    0 |     0 |    0 | valu_partial
+  1303 |    0 |    8 |    0 |     1 |    0 | STORE
+  1304 |    0 |    8 |    0 |     0 |    0 | 
+  1305 |    1 |    0 |    0 |     0 |    0 | valu_partial
+  1306 |    0 |    0 |    0 |     0 |    1 | vselect
+----------------------------------------------------------------------
+
+Tail summary (60 cycles):
+  VALU: 122 ops (avg 2.0/cycle, max 6)
+  ALU:  244 ops (avg 4.1/cycle, max 12)
+  Load: 32 ops (avg 0.5/cycle, max 2)
+  Store: 5 ops (avg 0.1/cycle, max 2)
+  Flow: 15 ops (avg 0.2/cycle, max 1)
+
+  Cycles with store: 5
+  Cycles VALU full (=6): 2
+  Cycles VALU empty (=0): 5
+
+============================================================
+BLOCK COMPLETION ANALYSIS
+============================================================
+
+Top 20 blocks by last VALU write cycle:
+----------------------------------------
+  Block  72 (addr  576- 583): last write at cycle 1305
+  Block 104 (addr  832- 839): last write at cycle 1302
+  Block 162 (addr 1296-1303): last write at cycle 1301
+  Block 163 (addr 1304-1311): last write at cycle 1301
+  Block  71 (addr  568- 575): last write at cycle 1298
+  Block 103 (addr  824- 831): last write at cycle 1295
+  Block 158 (addr 1264-1271): last write at cycle 1294
+  Block 159 (addr 1272-1279): last write at cycle 1294
+  Block  70 (addr  560- 567): last write at cycle 1272
+  Block 102 (addr  816- 823): last write at cycle 1269
+  Block 154 (addr 1232-1239): last write at cycle 1268
+  Block 155 (addr 1240-1247): last write at cycle 1268
+  Block  69 (addr  552- 559): last write at cycle 1264
+  Block 101 (addr  808- 815): last write at cycle 1261
+  Block 150 (addr 1200-1207): last write at cycle 1260
+  Block 151 (addr 1208-1215): last write at cycle 1260
+  Block 164 (addr 1312-1319): last write at cycle 1260
+  Block 160 (addr 1280-1287): last write at cycle 1259
+  Block  68 (addr  544- 551): last write at cycle 1253
+  Block 100 (addr  800- 807): last write at cycle 1250
+
+Last write cycle statistics:
+  Min: 535
+  Max: 1305
+  Spread: 770 cycles
+
+  Blocks finishing in last 100 cycles: 39
+  Blocks finishing in last 50 cycles: 18
