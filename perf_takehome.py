@@ -313,6 +313,7 @@ class KernelBuilder:
                     "tmp1": self.alloc_vec(),
                     "tmp2": self.alloc_vec(),
                     "tmp3": self.alloc_vec(),
+                    "tmp4": self.alloc_vec(),
                 }
             )
 
@@ -413,7 +414,8 @@ class KernelBuilder:
                             )
                             emit_xor(ctx["node"])
                         elif level == 3:
-                            # Level 3: 7 vselects for nodes 7-14
+                            # Level 3: 8 vselects for nodes 7-14
+                            # Extract all 3 selection bits upfront to avoid recomputation
                             slots.append(
                                 ("valu", ("-", ctx["tmp1"], idx_vec, seven_vec))
                             )
@@ -422,6 +424,9 @@ class KernelBuilder:
                             )
                             slots.append(
                                 ("valu", ("&", ctx["tmp3"], ctx["tmp1"], two_vec))
+                            )
+                            slots.append(
+                                ("valu", ("&", ctx["tmp4"], ctx["tmp1"], four_vec))
                             )
 
                             slots.append(
@@ -499,18 +504,12 @@ class KernelBuilder:
                             )
 
                             slots.append(
-                                ("valu", ("-", ctx["tmp2"], idx_vec, seven_vec))
-                            )
-                            slots.append(
-                                ("valu", ("&", ctx["tmp2"], ctx["tmp2"], four_vec))
-                            )
-                            slots.append(
                                 (
                                     "flow",
                                     (
                                         "vselect",
                                         ctx["node"],
-                                        ctx["tmp2"],
+                                        ctx["tmp4"],
                                         ctx["node"],
                                         ctx["tmp1"],
                                     ),

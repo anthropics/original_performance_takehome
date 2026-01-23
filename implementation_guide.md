@@ -165,14 +165,19 @@ AFTER (1 cycle):
 | BATCH=6 for all rounds | 3,241 | 45.6× | Fill VALU slots across rounds |
 | Wider prefetch window | 2,905 | 50.9× | Pack gathers into index-update bundles |
 
-### Session 6 (Final - Zolotukhin Algorithm)
+### Session 6 (Zolotukhin Algorithm)
 | Change | Cycles | Speedup | Notes |
 |--------|--------|---------|-------|
 | Automatic list scheduler | 1,307 | 113.0× | Greedy VLIW bundle packing |
 | vselect for levels 0-3 | 1,307 | 113.0× | Preload nodes 0-14, use flow ops |
 | Init phase merge | 1,305 | 113.2× | Let scheduler interleave init with main |
 
-**Final: 1,305 cycles (113.2× speedup)**
+### Session 7 (Value Reuse Analysis)
+| Change | Cycles | Speedup | Notes |
+|--------|--------|---------|-------|
+| Level 3 bit extraction | 1,304 | 113.3× | Extract all bits before vselects clobber temps |
+
+**Final: 1,304 cycles (113.3× speedup)**
 
 ## Final Solution Architecture
 
@@ -231,6 +236,30 @@ The final solution uses a fundamentally different approach: **automatic list sch
 
 3. **Different tile parameters**: Sweep of gs={14-20}, rt={10-16} confirmed gs=17, rt=13 is optimal
 
+4. **Skip last-round index update**: Result was 1323 cycles (+18 regression) - disrupted scheduler packing
+
+5. **Arithmetic selection replacing vselect**: +15 cycles - added VALU ops to already-bottlenecked engine
+
+6. **Moving work VALU↔ALU**: Makes respective bottleneck worse
+
+### Session 7: Value Reuse Analysis
+
+Used `scripts/value_reuse_profiler.py` to systematically find recomputation patterns.
+
+**Optimization Found**: Level 3 selection was computing `(idx-7)` twice:
+- First to extract bits 0,1 for vselects
+- Again after vselects (which clobbered tmp1) to extract bit 2
+
+**Fix**: Add `tmp4` register, extract all 3 bits upfront before vselects clobber temps.
+- Savings: 64 VALU ops (1 per level-3 block-round)
+- Result: 7267 → 7203 VALU ops, 1305 → 1304 cycles
+
+**Patterns Analyzed (No Further Optimization)**:
+1. Hash XOR operations - same addresses but different values each round
+2. idx=0 wraparound - 32 distinct destinations (one per block)
+3. Selection masks - computed fresh each round (idx changes)
+4. Address calculations - offset changes each iteration
+
 ## Detailed Analysis (Session 4)
 
 ### Bundle Distribution
@@ -282,12 +311,12 @@ For rounds 1,2,12,13,14,15: preload unique tree values, use arithmetic selection
 | Opus 4.5 2hr | <1,579 | 94× | ✓ |
 | Opus 4.5 11hr | <1,487 | 99× | ✓ |
 | Opus 4.5 improved | <1,363 | 108× | ✓ |
-| **ACHIEVED** | **1,305** | **113.2×** | **✓** |
-| Theoretical minimum | 1,212 | 121.9× | (92.9% achieved) |
+| **ACHIEVED** | **1,304** | **113.3×** | **✓** |
+| Theoretical minimum | 1,201 | 123.0× | (92.1% achieved) |
 
 ## Current Performance
-- Cycle count: 1,305
-- Speedup: 113.2×
+- Cycle count: 1,304
+- Speedup: 113.3×
 - Status: **COMPLETE** - Exceeds all target thresholds
 
 ## Theoretical Limits Analysis
@@ -296,18 +325,18 @@ The final solution is **VALU-bound**, not memory-bound:
 
 | Resource | Total Ops | Slots/Cycle | Minimum Cycles |
 |----------|-----------|-------------|----------------|
-| VALU | 7,267 | 6 | **1,212** ← bottleneck |
-| ALU | ~14,000 | 12 | 1,167 |
-| Load | ~1,800 | 2 | 900 |
-| Store | 64 | 2 | 32 |
+| VALU | 7,203 | 6 | **1,201** ← bottleneck |
+| ALU | 13,935 | 12 | 1,162 |
+| Load | 2,188 | 2 | 1,094 |
+| Store | 32 | 2 | 16 |
 
-### Why 93 Cycles Above Minimum?
+### Why 103 Cycles Above Minimum?
 
-The 1,305 - 1,212 = 93 cycle gap is structural overhead:
+The 1,304 - 1,201 = 103 cycle gap is structural overhead:
 
 1. **Startup ramp** (~33 cycles): Init broadcasts, constant loading
-2. **Drain phase** (~25 cycles): Final stores, pipeline emptying  
-3. **Scheduling gaps** (~35 cycles): Dependencies forcing serialization
+2. **Drain phase** (~50 cycles): Final stores, pipeline emptying  
+3. **Scheduling gaps** (~20 cycles): Dependencies forcing serialization
 
 ### Further Optimization Possibilities
 
@@ -316,7 +345,7 @@ To reduce further would require:
 2. **Globally optimal scheduler**: Current greedy scheduler is local-optimal
 3. **Speculative execution**: Risk incorrect results for speed
 
-At 92.9% of theoretical minimum, additional gains are marginal.
+At 92.1% of theoretical minimum, additional gains are marginal.
 
 ## Analysis Tools
 
