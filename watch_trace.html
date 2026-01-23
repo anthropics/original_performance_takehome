@@ -46,12 +46,26 @@
                 return mtime;
             }
 
+            async function getBlobFromTrace(traceUrl) {
+                const resp = await fetch(traceUrl);
+                // Error checking is left as an exercise to the reader.
+
+                const reader = resp.body.getReader();
+                const chunks = [];
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                }
+                
+                return new Blob(chunks);
+            }
+
             async function fetchAndOpen(traceUrl) {
                 logs.innerText += `Fetching trace from ${traceUrl}...\n`;
                 const mtime = await getMtime();
-                const resp = await fetch(traceUrl);
-                // Error checcking is left as an exercise to the reader.
-                const blob = await resp.blob();
+                const blob = await getBlobFromTrace(traceUrl);
                 const arrayBuffer = await blob.arrayBuffer();
                 logs.innerText += `fetch() complete, now passing to ui.perfetto.dev\n`;
                 openTrace(arrayBuffer, traceUrl, mtime);
@@ -62,8 +76,7 @@
                 console.log(newMtime, mtime);
                 if (newMtime !== mtime) {
                     logs.innerText += `Trace updated, fetching new version...\n`;
-                    const resp = await fetch(traceUrl);
-                    const blob = await resp.blob();
+                    const blob = await getBlobFromTrace(traceUrl);
                     const arrayBuffer = await blob.arrayBuffer();
                     logs.innerText += `New trace fetched, opening...\n`;
                     sendTrace(win, arrayBuffer, traceUrl);
