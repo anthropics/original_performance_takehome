@@ -318,6 +318,83 @@ To reduce further would require:
 
 At 92.9% of theoretical minimum, additional gains are marginal.
 
+## Analysis Tools
+
+Three tools in `scripts/` for understanding and optimizing VLIW kernels:
+
+### 1. Bottleneck Detector (`scripts/bottleneck_detector.py`)
+
+Determines whether kernel is VALU-bound, memory-bound, etc. and provides actionable recommendations.
+
+```bash
+python scripts/bottleneck_detector.py
+```
+
+Output:
+- Operation counts per engine
+- Theoretical minimum cycles per engine
+- Identifies bottleneck (highest minimum)
+- Efficiency percentage
+- Specific recommendations based on bottleneck type
+
+### 2. Profiler (`scripts/profiler.py`)
+
+Per-cycle utilization breakdown with histograms and phase analysis.
+
+```bash
+python scripts/profiler.py                    # Summary + init/drain phases
+python scripts/profiler.py --histogram        # Add utilization histograms
+python scripts/profiler.py --bubbles          # Find low-utilization cycles
+python scripts/profiler.py --phase steady     # Analyze middle section
+```
+
+Output:
+- Average utilization per engine
+- Utilization distribution histogram
+- Init phase breakdown (first 50 cycles)
+- Drain phase breakdown (last 50 cycles)
+- Scheduling bubbles (cycles with VALU <= 3)
+
+### 3. Schedule Visualizer (`scripts/visualize_schedule.py`)
+
+ASCII visualization of VLIW bundles showing gaps and patterns.
+
+```bash
+python scripts/visualize_schedule.py --gaps           # Find contiguous low-util regions
+python scripts/visualize_schedule.py --start 0 --end 100  # Visualize cycle range
+python scripts/visualize_schedule.py --compact --all  # Full schedule, compact view
+```
+
+Output:
+- ASCII bars showing per-cycle utilization
+- Gap analysis (contiguous regions of low VALU)
+- Position breakdown (init vs steady vs drain)
+
+### Recommended Workflow
+
+1. **Start with bottleneck detector** - Know what you're optimizing for
+2. **Run profiler with --histogram** - Understand utilization distribution
+3. **Run visualizer with --gaps** - Find where cycles are wasted
+4. **Focus on largest gaps** - Init/drain phases often have most waste
+
+### Example Session
+
+```bash
+$ python scripts/bottleneck_detector.py
+DIAGNOSIS: VALU-BOUND
+Theoretical minimum: 1212 cycles
+Actual: 1305 cycles
+Efficiency: 92.9%
+
+$ python scripts/visualize_schedule.py --gaps
+Total gap cycles: 110
+  Init phase (first 50): 30 cycles
+  Drain phase (last 50): 46 cycles
+  Steady state: 0 gaps
+```
+
+This tells us: 76 of 93 wasted cycles are in init/drain phases. Steady state is optimal.
+
 ## External References
 - Designing a SIMD Algorithm from Scratch: https://mcyoung.xyz/2023/11/27/simd-base64/
 - AVX-512 Multi-hash Computation (Intel): https://networkbuilders.intel.com/docs/networkbuilders/intel-avx-512-ultra-parallelized-multi-hash-computation-for-data-streaming-workloads-technology-guide-1693301077.pdf
