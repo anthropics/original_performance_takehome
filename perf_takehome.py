@@ -848,8 +848,8 @@ class KernelBuilder:
                         group_body.append(("alu", ("<", bs["hash_tmp"], bs["tmp_idx"], self.scratch["n_nodes"]), item, round_num))
                         group_body.append(("alu", ("*", bs["tmp_idx"], bs["tmp_idx"], bs["hash_tmp"]), item, round_num))
 
-                elif round_num == 1 or round_num == 12:
-                    # Items at index 1 or 2 - use vselect
+                elif round_num == 1 or round_num == forest_height + 2:
+                    # Items at index 1 or 2 - use vselect (round 1 and round after wrap)
                     for ci in range(0, group_size, VLEN):
                         item = group_start + ci
                         idx_v = var_bases["tmp_idx"] + ci
@@ -871,8 +871,8 @@ class KernelBuilder:
                         group_body.append(("alu", ("<", bs["hash_tmp"], bs["tmp_idx"], self.scratch["n_nodes"]), item, round_num))
                         group_body.append(("alu", ("*", bs["tmp_idx"], bs["tmp_idx"], bs["hash_tmp"]), item, round_num))
 
-                elif round_num == 11:
-                    # All items at index 0 (wrapped around) - same as round 0
+                elif round_num == forest_height + 1:
+                    # All items at index 0 (wrapped around after traversing full tree depth)
                     for i in range(group_size):
                         item = group_start + i
                         bs = batch_scratch[i]
