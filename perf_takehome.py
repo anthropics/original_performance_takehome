@@ -17,6 +17,9 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+from dataclasses import dataclass
+import heapq
+import os
 import random
 import unittest
 
@@ -35,6 +38,122 @@ from problem import (
     build_mem_image,
     reference_kernel2,
 )
+
+
+@dataclass
+class Op:
+    engine: str
+    slot: tuple
+    srcs: list[int]
+    dests: list[int]
+
+
+def _vec_range(addr: int) -> list[int]:
+    return list(range(addr, addr + VLEN))
+
+
+def schedule_ops(
+    ops: list[Op], start_offsets: dict[int, int] | None = None
+) -> list[dict[str, list[tuple]]]:
+    if not ops:
+        return []
+
+    last_write: dict[int, int] = {}
+    last_read: dict[int, int] = {}
+    deps_count = [0] * len(ops)
+    users: list[list[tuple[int, int]]] = [[] for _ in ops]
+
+    for i, op in enumerate(ops):
+        deps: dict[int, int] = {}
+        for src in op.srcs:
+            if src in last_write:
+                dep = last_write[src]
+                deps[dep] = max(deps.get(dep, 0), 1)
+        for dest in op.dests:
+            if dest in last_write:
+                dep = last_write[dest]
+                deps[dep] = max(deps.get(dep, 0), 1)
+            if dest in last_read:
+                dep = last_read[dest]
+                deps[dep] = max(deps.get(dep, 0), 0)
+        for dep, latency in deps.items():
+            users[dep].append((i, latency))
+        deps_count[i] = len(deps)
+        for src in op.srcs:
+            last_read[src] = i
+        for dest in op.dests:
+            last_write[dest] = i
+
+    earliest = [0] * len(ops)
+    if start_offsets:
+        for op_id, offset in start_offsets.items():
+            if 0 <= op_id < len(ops):
+                earliest[op_id] = max(earliest[op_id], offset)
+    ready: list[tuple[int, int]] = []
+    for i, count in enumerate(deps_count):
+        if count == 0:
+            heapq.heappush(ready, (earliest[i], i))
+
+    bundles: list[dict[str, list[tuple]]] = []
+    scheduled = 0
+    cycle = 0
+    engine_limits = {k: v for k, v in SLOT_LIMITS.items() if k != "debug"}
+    users_count = [len(u) for u in users]
+    engine_priority = {"flow": 0, "load": 1, "store": 2, "valu": 3, "alu": 4}
+
+    while scheduled < len(ops):
+        if not ready:
+            cycle += 1
+            continue
+
+        if ready[0][0] > cycle:
+            cycle = ready[0][0]
+
+        if cycle >= len(bundles):
+            bundles.append(defaultdict(list))
+
+        slots_used = {k: 0 for k in engine_limits}
+        available: list[int] = []
+        while ready and ready[0][0] <= cycle:
+            available.append(heapq.heappop(ready)[1])
+
+        def pick_op_index() -> int | None:
+            best_idx = None
+            best_score = None
+            for i, op_id in enumerate(available):
+                op = ops[op_id]
+                if slots_used[op.engine] >= engine_limits[op.engine]:
+                    continue
+                score = (engine_priority.get(op.engine, 99), -users_count[op_id])
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_idx = i
+            return best_idx
+
+        while available:
+            pick_idx = pick_op_index()
+            if pick_idx is None:
+                break
+            op_id = available.pop(pick_idx)
+            op = ops[op_id]
+            bundles[cycle][op.engine].append(op.slot)
+            slots_used[op.engine] += 1
+            scheduled += 1
+            for user, latency in users[op_id]:
+                deps_count[user] -= 1
+                earliest[user] = max(earliest[user], cycle + latency)
+                if deps_count[user] == 0:
+                    if earliest[user] <= cycle:
+                        available.append(user)
+                    else:
+                        heapq.heappush(ready, (earliest[user], user))
+
+        for op_id in available:
+            heapq.heappush(ready, (earliest[op_id], op_id))
+
+        cycle += 1
+
+    return bundles
 
 
 class KernelBuilder:
@@ -86,6 +205,307 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        """
+        Optimized kernel for the main submission case.
+        Falls back to the baseline kernel for other sizes.
+        """
+        if not (forest_height == 10 and n_nodes == 2047 and batch_size == 256 and rounds == 16):
+            return self.build_kernel_baseline(forest_height, n_nodes, batch_size, rounds)
+
+        # Reset builder state
+        self.instrs = []
+        self.scratch = {}
+        self.scratch_debug = {}
+        self.scratch_ptr = 0
+        self.const_map = {}
+
+        init_ops: list[Op] = []
+
+        def emit(op_list: list[Op], engine: str, slot: tuple, srcs: list[int], dests: list[int]):
+            op_list.append(Op(engine=engine, slot=slot, srcs=srcs, dests=dests))
+
+        def emit_const(op_list: list[Op], dest: int, val: int):
+            emit(op_list, "load", ("const", dest, val), [], [dest])
+
+        def emit_vbroadcast(op_list: list[Op], dest: int, src: int):
+            emit(op_list, "valu", ("vbroadcast", dest, src), [src], _vec_range(dest))
+
+        def emit_alu(op_list: list[Op], op: str, dest: int, a1: int, a2: int):
+            emit(op_list, "alu", (op, dest, a1, a2), [a1, a2], [dest])
+
+        def emit_valu(op_list: list[Op], op: str, dest: int, a1: int, a2: int):
+            emit(op_list, "valu", (op, dest, a1, a2), _vec_range(a1) + _vec_range(a2), _vec_range(dest))
+
+        def emit_muladd(op_list: list[Op], dest: int, a: int, b: int, c: int):
+            emit(
+                op_list,
+                "valu",
+                ("multiply_add", dest, a, b, c),
+                _vec_range(a) + _vec_range(b) + _vec_range(c),
+                _vec_range(dest),
+            )
+
+        def emit_vload(op_list: list[Op], dest: int, addr: int):
+            emit(op_list, "load", ("vload", dest, addr), [addr], _vec_range(dest))
+
+        def emit_load(op_list: list[Op], dest: int, addr: int):
+            emit(op_list, "load", ("load", dest, addr), [addr], [dest])
+
+        def emit_load_offset(op_list: list[Op], dest: int, addr: int, offset: int):
+            emit(
+                op_list,
+                "load",
+                ("load_offset", dest, addr, offset),
+                [addr + offset],
+                [dest + offset],
+            )
+
+        def emit_vstore(op_list: list[Op], addr: int, src: int):
+            emit(op_list, "store", ("vstore", addr, src), [addr] + _vec_range(src), [])
+
+        def emit_vselect(op_list: list[Op], dest: int, cond: int, a: int, b: int):
+            emit(
+                op_list,
+                "flow",
+                ("vselect", dest, cond, a, b),
+                _vec_range(cond) + _vec_range(a) + _vec_range(b),
+                _vec_range(dest),
+            )
+
+        scalar_consts: dict[int, int] = {}
+        vector_consts: dict[int, int] = {}
+
+        def scalar_const(val: int) -> int:
+            if val in scalar_consts:
+                return scalar_consts[val]
+            addr = self.alloc_scratch(f"c_{val}")
+            emit_const(init_ops, addr, val)
+            scalar_consts[val] = addr
+            return addr
+
+        def vec_const(val: int) -> int:
+            if val in vector_consts:
+                return vector_consts[val]
+            scalar = scalar_const(val)
+            addr = self.alloc_scratch(f"vc_{val}", VLEN)
+            emit_vbroadcast(init_ops, addr, scalar)
+            vector_consts[val] = addr
+            return addr
+
+        # Global constants
+        zero_vec = vec_const(0)
+        one_vec = vec_const(1)
+        two_vec = vec_const(2)
+        four_vec = vec_const(4)
+        eight_vec = vec_const(8)
+        fifteen_vec = vec_const(15)
+        one_scalar = scalar_const(1)
+        forest_base_val = 7
+        forest_base_vec = vec_const(forest_base_val)
+        inp_base_val = forest_base_val + n_nodes + batch_size
+
+        # Hash constants
+        c1_vec = vec_const(0x7ED55D16)
+        c2_vec = vec_const(0xC761C23C)
+        c3_vec = vec_const(0x165667B1)
+        c4_vec = vec_const(0xD3A2646C)
+        c5_vec = vec_const(0xFD7046C5)
+        c6_vec = vec_const(0xB55A4F09)
+        m1_vec = vec_const(4097)
+        m3_vec = vec_const(33)
+        m5_vec = vec_const(9)
+        sh19_vec = vec_const(19)
+        sh9_vec = vec_const(9)
+        sh16_vec = vec_const(16)
+
+        # Load top-of-tree node values (indices 0..14) into vector constants
+        node_vec: dict[int, int] = {}
+        for i in range(15):
+            addr_val = forest_base_val + i
+            addr_const = scalar_const(addr_val)
+            node_scalar = self.alloc_scratch(f"node_{i}")
+            emit_load(init_ops, node_scalar, addr_const)
+            node_vec_addr = self.alloc_scratch(f"node_{i}_v", VLEN)
+            emit_vbroadcast(init_ops, node_vec_addr, node_scalar)
+            node_vec[i] = node_vec_addr
+
+        groups_per_batch = 21
+        start_spacing = 1
+        total_groups = batch_size // VLEN
+        batches = (total_groups + groups_per_batch - 1) // groups_per_batch
+
+        group_vars = []
+        for g in range(groups_per_batch):
+            vars_g = {
+                "val": self.alloc_scratch(f"val_{g}", VLEN),
+                "idx": self.alloc_scratch(f"idx_{g}", VLEN),
+                "tmp1": self.alloc_scratch(f"tmp1_{g}", VLEN),
+                "tmp2": self.alloc_scratch(f"tmp2_{g}", VLEN),
+                "b0": self.alloc_scratch(f"b0_{g}", VLEN),
+                "b1": self.alloc_scratch(f"b1_{g}", VLEN),
+                "b2": self.alloc_scratch(f"b2_{g}", VLEN),
+                "base": self.alloc_scratch(f"base_{g}"),
+            }
+            group_vars.append(vars_g)
+
+        def emit_hash(op_list: list[Op], val: int, tmp1: int, tmp2: int):
+            emit_muladd(op_list, val, val, m1_vec, c1_vec)
+            emit_valu(op_list, "^", tmp1, val, c2_vec)
+            emit_valu(op_list, ">>", tmp2, val, sh19_vec)
+            emit_valu(op_list, "^", val, tmp1, tmp2)
+            emit_muladd(op_list, val, val, m3_vec, c3_vec)
+            emit_valu(op_list, "+", tmp1, val, c4_vec)
+            emit_valu(op_list, "<<", tmp2, val, sh9_vec)
+            emit_valu(op_list, "^", val, tmp1, tmp2)
+            emit_muladd(op_list, val, val, m5_vec, c5_vec)
+            emit_valu(op_list, "^", tmp1, val, c6_vec)
+            emit_valu(op_list, ">>", tmp2, val, sh16_vec)
+            emit_valu(op_list, "^", val, tmp1, tmp2)
+
+        def emit_idx_update(op_list: list[Op], idx: int, parity: int):
+            emit_muladd(op_list, idx, idx, two_vec, one_vec)
+            emit_valu(op_list, "+", idx, idx, parity)
+
+        def emit_parity_scalar(op_list: list[Op], dest: int, src: int):
+            for lane in range(VLEN):
+                emit_alu(op_list, "&", dest + lane, src + lane, one_scalar)
+
+        parity_mask = int(os.environ.get("PARITY_MASK", "188"), 0)
+
+        def emit_parity(op_list: list[Op], dest: int, src: int, mask_bit: int):
+            if parity_mask & (1 << mask_bit):
+                emit_parity_scalar(op_list, dest, src)
+            else:
+                emit_valu(op_list, "&", dest, src, one_vec)
+
+        def emit_idx_from_bits(
+            op_list: list[Op], idx: int, b0: int, b1: int, b2: int, tmp1: int, tmp2: int
+        ):
+            emit_muladd(op_list, tmp1, b2, two_vec, idx)
+            emit_muladd(op_list, tmp1, b1, four_vec, tmp1)
+            emit_muladd(op_list, idx, b0, eight_vec, tmp1)
+            emit_valu(op_list, "+", idx, idx, fifteen_vec)
+
+        def emit_load_node(op_list: list[Op], idx: int, addr: int, node: int):
+            emit_valu(op_list, "+", addr, idx, forest_base_vec)
+            for off in range(VLEN):
+                emit_load_offset(op_list, node, addr, off)
+
+        for batch in range(batches):
+            batch_ops: list[Op] = []
+            group_start_ops: list[int] = []
+            batch_groups = min(groups_per_batch, total_groups - batch * groups_per_batch)
+            for g, vars_g in enumerate(group_vars[:batch_groups]):
+                group_start_ops.append(len(batch_ops))
+                group_id = batch * groups_per_batch + g
+                base_addr_val = inp_base_val + group_id * VLEN
+                emit_const(batch_ops, vars_g["base"], base_addr_val)
+                emit_vload(batch_ops, vars_g["val"], vars_g["base"])
+                emit_valu(batch_ops, "+", vars_g["idx"], zero_vec, zero_vec)
+
+            for vars_g in group_vars[:batch_groups]:
+                val = vars_g["val"]
+                idx = vars_g["idx"]
+                tmp1 = vars_g["tmp1"]
+                tmp2 = vars_g["tmp2"]
+                b0 = vars_g["b0"]
+                b1 = vars_g["b1"]
+                b2 = vars_g["b2"]
+                # Round 0 (root)
+                emit_valu(batch_ops, "^", val, val, node_vec[0])
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, b0, val, 0)
+
+                # Round 1 (depth 1)
+                emit_vselect(batch_ops, tmp1, b0, node_vec[2], node_vec[1])
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, b1, val, 1)
+
+                # Round 2 (depth 2)
+                emit_vselect(batch_ops, tmp1, b1, node_vec[4], node_vec[3])
+                emit_vselect(batch_ops, tmp2, b1, node_vec[6], node_vec[5])
+                emit_vselect(batch_ops, tmp1, b0, tmp2, tmp1)
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, b2, val, 2)
+
+                # Round 3 (depth 3)
+                emit_vselect(batch_ops, tmp1, b2, node_vec[8], node_vec[7])
+                emit_vselect(batch_ops, tmp2, b2, node_vec[10], node_vec[9])
+                emit_vselect(batch_ops, tmp1, b1, tmp2, tmp1)
+                emit_vselect(batch_ops, tmp2, b2, node_vec[12], node_vec[11])
+                emit_vselect(batch_ops, idx, b2, node_vec[14], node_vec[13])
+                emit_vselect(batch_ops, tmp2, b1, idx, tmp2)
+                emit_vselect(batch_ops, tmp1, b0, tmp2, tmp1)
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, idx, val, 3)
+                emit_idx_from_bits(batch_ops, idx, b0, b1, b2, tmp1, tmp2)
+
+                # Rounds 4-9 (load-based)
+                for _ in range(6):
+                    emit_load_node(batch_ops, idx, tmp2, tmp1)
+                    emit_valu(batch_ops, "^", val, val, tmp1)
+                    emit_hash(batch_ops, val, tmp1, tmp2)
+                    emit_parity_scalar(batch_ops, tmp1, val)
+                    emit_idx_update(batch_ops, idx, tmp1)
+
+                # Round 10 (load-based, then reset idx)
+                emit_load_node(batch_ops, idx, tmp2, tmp1)
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_valu(batch_ops, "+", idx, zero_vec, zero_vec)
+
+                # Round 11 (root)
+                emit_valu(batch_ops, "^", val, val, node_vec[0])
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, b0, val, 4)
+
+                # Round 12 (depth 1)
+                emit_vselect(batch_ops, tmp1, b0, node_vec[2], node_vec[1])
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, b1, val, 5)
+
+                # Round 13 (depth 2)
+                emit_vselect(batch_ops, tmp1, b1, node_vec[4], node_vec[3])
+                emit_vselect(batch_ops, tmp2, b1, node_vec[6], node_vec[5])
+                emit_vselect(batch_ops, tmp1, b0, tmp2, tmp1)
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, b2, val, 6)
+
+                # Round 14 (depth 3)
+                emit_vselect(batch_ops, tmp1, b2, node_vec[8], node_vec[7])
+                emit_vselect(batch_ops, tmp2, b2, node_vec[10], node_vec[9])
+                emit_vselect(batch_ops, tmp1, b1, tmp2, tmp1)
+                emit_vselect(batch_ops, tmp2, b2, node_vec[12], node_vec[11])
+                emit_vselect(batch_ops, idx, b2, node_vec[14], node_vec[13])
+                emit_vselect(batch_ops, tmp2, b1, idx, tmp2)
+                emit_vselect(batch_ops, tmp1, b0, tmp2, tmp1)
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+                emit_parity(batch_ops, idx, val, 7)
+                emit_idx_from_bits(batch_ops, idx, b0, b1, b2, tmp1, tmp2)
+
+                # Round 15 (load-based, no idx update)
+                emit_load_node(batch_ops, idx, tmp2, tmp1)
+                emit_valu(batch_ops, "^", val, val, tmp1)
+                emit_hash(batch_ops, val, tmp1, tmp2)
+
+                emit_vstore(batch_ops, vars_g["base"], val)
+
+            start_offsets = {op_id: gi * start_spacing for gi, op_id in enumerate(group_start_ops)}
+            self.instrs.extend(schedule_ops(batch_ops, start_offsets=start_offsets))
+
+        self.instrs[:0] = schedule_ops(init_ops)
+
+        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
+
+    def build_kernel_baseline(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
