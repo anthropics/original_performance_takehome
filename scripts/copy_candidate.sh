@@ -17,6 +17,10 @@ BASE_DIR="$PROJECT_ROOT/$1"
 SOURCE_ID="$2"
 DEST_ID="$3"
 
+# Strip CAND_ prefix if present (handles both "001" and "CAND_001" formats)
+SOURCE_ID="${SOURCE_ID#CAND_}"
+DEST_ID="${DEST_ID#CAND_}"
+
 SOURCE_DIR="$BASE_DIR/candidates/CAND_$SOURCE_ID"
 DEST_DIR="$BASE_DIR/candidates/CAND_$DEST_ID"
 
