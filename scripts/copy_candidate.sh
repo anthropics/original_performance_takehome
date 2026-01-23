@@ -29,9 +29,17 @@ if [ ! -d "$SOURCE_DIR" ]; then
     exit 1
 fi
 
+# Check if destination exists
 if [ -d "$DEST_DIR" ]; then
-    echo "ERROR: Destination candidate $DEST_ID already exists"
-    exit 1
+    # Count files in the destination (excluding . and ..)
+    FILE_COUNT=$(find "$DEST_DIR" -mindepth 1 -maxdepth 1 | wc -l)
+    if [ "$FILE_COUNT" -eq 0 ]; then
+        # Empty placeholder directory from plan_generation.sh - remove it
+        rmdir "$DEST_DIR"
+    else
+        echo "ERROR: Destination candidate $DEST_ID already exists"
+        exit 1
+    fi
 fi
 
 # Copy the directory
