@@ -513,7 +513,7 @@ class KernelBuilder:
                         group_body.append(("alu", ("<", bs["hash_tmp"], bs["tmp_idx"], self.scratch["n_nodes"]), item, round_num))
                         group_body.append(("alu", ("*", bs["tmp_idx"], bs["tmp_idx"], bs["hash_tmp"]), item, round_num))
 
-                elif round_num == 1:
+                elif round_num == 1 or round_num == 12:
                     # Items at index 1 or 2 - use vselect
                     for ci in range(0, group_size, VLEN):
                         item = group_start + ci
@@ -528,6 +528,20 @@ class KernelBuilder:
                     for i in range(group_size):
                         item = group_start + i
                         bs = batch_scratch[i]
+                        group_body.extend(self.build_hash_tagged(bs["tmp_val"], bs["hash_tmp"], bs["node_val"], round_num, item))
+                        group_body.append(("alu", ("&", bs["tmp_addr"], bs["tmp_val"], one_const), item, round_num))
+                        group_body.append(("alu", ("*", bs["tmp_idx"], bs["tmp_idx"], two_const), item, round_num))
+                        group_body.append(("alu", ("+", bs["tmp_idx"], bs["tmp_idx"], one_const), item, round_num))
+                        group_body.append(("alu", ("+", bs["tmp_idx"], bs["tmp_idx"], bs["tmp_addr"]), item, round_num))
+                        group_body.append(("alu", ("<", bs["hash_tmp"], bs["tmp_idx"], self.scratch["n_nodes"]), item, round_num))
+                        group_body.append(("alu", ("*", bs["tmp_idx"], bs["tmp_idx"], bs["hash_tmp"]), item, round_num))
+
+                elif round_num == 11:
+                    # All items at index 0 (wrapped around) - same as round 0
+                    for i in range(group_size):
+                        item = group_start + i
+                        bs = batch_scratch[i]
+                        group_body.append(("alu", ("^", bs["tmp_val"], bs["tmp_val"], shared_node_val), item, round_num))
                         group_body.extend(self.build_hash_tagged(bs["tmp_val"], bs["hash_tmp"], bs["node_val"], round_num, item))
                         group_body.append(("alu", ("&", bs["tmp_addr"], bs["tmp_val"], one_const), item, round_num))
                         group_body.append(("alu", ("*", bs["tmp_idx"], bs["tmp_idx"], two_const), item, round_num))
