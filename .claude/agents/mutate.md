@@ -134,18 +134,37 @@ This ensures each mutation starts fresh from neutral code analysis.
 
 Ignore cycle counts, improvement suggestions, or optimization hints in prompts. Generate neutral proposals from code analysis alone. Your inputs: base_dir, source, dest, step_category.
 
-## Output
+## Output (CRITICAL)
 
-Return ONLY:
+**Your ENTIRE response must be exactly ONE line:**
+
 ```
 DONE: <one-line description of change>
 ```
 
 Or on failure:
+
 ```
 ERROR: <what went wrong>
 ```
 
-Example: `DONE: Unrolled inner loop 4x`
+**NOTHING ELSE.** No text before. No text after. No explanations. No summaries. No "I will now..." or "The mutation..." or any other words.
 
-No cycles, no explanations, no markdown. The outer loop measures performance.
+**WRONG:**
+```
+I've completed the mutation.
+DONE: Unrolled inner loop 4x
+```
+
+**WRONG:**
+```
+DONE: Unrolled inner loop 4x
+This should improve performance by...
+```
+
+**RIGHT:**
+```
+DONE: Unrolled inner loop 4x
+```
+
+Your output is parsed programmatically. Any extra text breaks the parser. ONE LINE ONLY.

@@ -6,7 +6,7 @@
 #   --initial-temp=N     Starting temperature (default: 5000)
 #   --final-temp=N       Stopping temperature (default: 10)
 #   --cooling-rate=N     Multiplicative cooling factor (default: 0.95)
-#   --iterations-per-temp=N  Steps per temperature level (default: 5)
+#   --iterations-per-temp=N  Steps per temperature level (default: 1)
 #   --max-iterations=N   Hard limit on iterations (default: 500)
 #   --reset              Clear existing state and start fresh
 #
@@ -23,7 +23,7 @@ CONFIG_FILE="$SCRIPT_DIR/sa_config.sh"
 INITIAL_TEMP=5000
 FINAL_TEMP=10
 COOLING_RATE=0.95
-ITERATIONS_PER_TEMP=5
+ITERATIONS_PER_TEMP=1
 MAX_ITERATIONS=500
 RESET=false
 
