@@ -212,13 +212,16 @@ def add_stagger_dependencies(graph: DependencyGraph, wave_size: int = 8):
         by_item_round[key].sort(key=lambda n: n.id)
 
     first_node = {}
+    last_node = {}
     for key, nodes in by_item_round.items():
         if nodes:
             first_node[key] = nodes[0]
+            last_node[key] = nodes[-1]
 
     items = sorted(set(k[0] for k in by_item_round.keys()))
     rounds = sorted(set(k[1] for k in by_item_round.keys()))
 
+    # Within-round stagger: wave K+1 depends on wave K
     for round_num in rounds:
         for item in items:
             wave = item // wave_size
@@ -228,6 +231,17 @@ def add_stagger_dependencies(graph: DependencyGraph, wave_size: int = 8):
                 key_prev = (prev_item, round_num)
                 if key_curr in first_node and key_prev in first_node:
                     graph.add_edge(first_node[key_prev].id, first_node[key_curr].id)
+
+    # Cross-round stagger: item's next round starts after previous round's load
+    # This helps overlap loads from round N+1 with VALU from round N
+    for item in items:
+        for round_num in rounds[:-1]:
+            key_curr = (item, round_num)
+            key_next = (item, round_num + 1)
+            if key_curr in last_node and key_next in first_node:
+                # Next round's first op depends on current round's last op
+                # This is implicit via data deps, but being explicit helps scheduler
+                pass  # Data deps already handle this
 
 
 def pack_levels_into_bundles(graph: DependencyGraph, levels: list[list[int]],
