@@ -1,0 +1,109 @@
+Parameter Sweep: group_size vs round_tile
+======================================================================
+
+Baseline (gs=17, rt=13):
+forest_height=10, rounds=16, batch_size=256
+  → None cycles
+
+Testing gs=14, rt=10... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=14, rt=11... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=14, rt=12... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=14, rt=13... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=14, rt=14... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=14, rt=15... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=14, rt=16... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=15, rt=10... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=15, rt=11... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=15, rt=12... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=15, rt=13... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=15, rt=14... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=15, rt=15... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=15, rt=16... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=16, rt=10... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=16, rt=11... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=16, rt=12... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=16, rt=13... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=16, rt=14... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=16, rt=15... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=16, rt=16... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=17, rt=10... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=17, rt=11... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=17, rt=12... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=17, rt=14... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=17, rt=15... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=17, rt=16... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=18, rt=10... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=18, rt=11... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=18, rt=12... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=18, rt=13... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=18, rt=14... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=18, rt=15... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=18, rt=16... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=19, rt=10... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=19, rt=11... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=19, rt=12... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=19, rt=13... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=19, rt=14... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=19, rt=15... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=19, rt=16... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=20, rt=10... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=20, rt=11... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=20, rt=12... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=20, rt=13... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=20, rt=14... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=20, rt=15... forest_height=10, rounds=16, batch_size=256
+FAILED
+Testing gs=20, rt=16... forest_height=10, rounds=16, batch_size=256
+FAILED
+
+======================================================================
+TOP 10 RESULTS:
+======================================================================
+
+✓ Baseline (gs=17, rt=13) is optimal
