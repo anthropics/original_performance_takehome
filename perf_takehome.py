@@ -302,7 +302,9 @@ class KernelBuilder:
         eight_vec = vec_const(8)
         fifteen_vec = vec_const(15)
         one_scalar = scalar_const(1)
+        fifteen_scalar = scalar_const(15)
         forest_base_val = 7
+        forest_base_scalar = scalar_const(forest_base_val)
         forest_base_vec = vec_const(forest_base_val)
         inp_base_val = forest_base_val + n_nodes + batch_size
 
@@ -364,9 +366,15 @@ class KernelBuilder:
             emit_valu(op_list, ">>", tmp2, val, sh16_vec)
             emit_valu(op_list, "^", val, tmp1, tmp2)
 
+        idx_add_alu = os.environ.get("IDX_ADD_ALU", "1") == "1"
+
         def emit_idx_update(op_list: list[Op], idx: int, parity: int):
             emit_muladd(op_list, idx, idx, two_vec, one_vec)
-            emit_valu(op_list, "+", idx, idx, parity)
+            if idx_add_alu:
+                for lane in range(VLEN):
+                    emit_alu(op_list, "+", idx + lane, idx + lane, parity + lane)
+            else:
+                emit_valu(op_list, "+", idx, idx, parity)
 
         def emit_parity_scalar(op_list: list[Op], dest: int, src: int):
             for lane in range(VLEN):
@@ -380,16 +388,28 @@ class KernelBuilder:
             else:
                 emit_valu(op_list, "&", dest, src, one_vec)
 
+        idx_bits_add_alu = os.environ.get("IDX_BITS_ADD_ALU", "1") == "1"
+
         def emit_idx_from_bits(
             op_list: list[Op], idx: int, b0: int, b1: int, b2: int, tmp1: int, tmp2: int
         ):
             emit_muladd(op_list, tmp1, b2, two_vec, idx)
             emit_muladd(op_list, tmp1, b1, four_vec, tmp1)
             emit_muladd(op_list, idx, b0, eight_vec, tmp1)
-            emit_valu(op_list, "+", idx, idx, fifteen_vec)
+            if idx_bits_add_alu:
+                for lane in range(VLEN):
+                    emit_alu(op_list, "+", idx + lane, idx + lane, fifteen_scalar)
+            else:
+                emit_valu(op_list, "+", idx, idx, fifteen_vec)
+
+        load_addr_alu = os.environ.get("LOAD_ADDR_ALU", "1") == "1"
 
         def emit_load_node(op_list: list[Op], idx: int, addr: int, node: int):
-            emit_valu(op_list, "+", addr, idx, forest_base_vec)
+            if load_addr_alu:
+                for off in range(VLEN):
+                    emit_alu(op_list, "+", addr + off, idx + off, forest_base_scalar)
+            else:
+                emit_valu(op_list, "+", addr, idx, forest_base_vec)
             for off in range(VLEN):
                 emit_load_offset(op_list, node, addr, off)
 
