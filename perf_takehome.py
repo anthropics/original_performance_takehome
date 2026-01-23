@@ -281,7 +281,7 @@ def build_csr_graph(instructions: list[tuple], add_stagger: bool = True) -> CSRG
 
     # Add stagger dependencies before finalization
     if add_stagger:
-        add_stagger_deps_csr(graph, wave_size=8)
+        add_stagger_deps_csr(graph, wave_size=12)
 
     graph.finalize_csr()
     return graph
@@ -480,8 +480,8 @@ def pack_with_local_queues(graph: CSRGraph, broadcast_state: dict) -> list[dict]
         for valu_slot, node_ids in valu_slots:
             ready_by_engine["valu"].append((valu_slot, node_ids))
 
-        # Pack a bundle - try valu first to keep vectorized work moving
-        for engine in ["valu", "load", "store", "flow", "alu", "debug"]:
+        # Pack a bundle - prioritize loads to keep pipeline full
+        for engine in ["load", "valu", "store", "flow", "alu", "debug"]:
             if ready_by_engine.get(engine):
                 limit = SLOT_LIMITS.get(engine, 1)
                 take = min(limit, len(ready_by_engine[engine]))
@@ -572,7 +572,7 @@ def pack_levels_into_bundles(graph: DependencyGraph, levels: list[list[int]],
     broadcast_cache = broadcast_state['cache']
     broadcast_ptr = broadcast_state['ptr']
 
-    add_stagger_dependencies(graph, wave_size=8)
+    add_stagger_dependencies(graph, wave_size=12)
 
     completed = set()
     remaining_in_degree = {nid: node.in_degree for nid, node in graph.nodes.items()}
