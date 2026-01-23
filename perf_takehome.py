@@ -241,7 +241,6 @@ class KernelBuilder:
             ("load", ("const", self.scratch["inp_values_p"], INP_VALUES_P))
         )
 
-        zero_vec = self.scratch_vconst(0, "v_zero", init_slots)
         one_vec = self.scratch_vconst(1, "v_one", init_slots)
         two_vec = self.scratch_vconst(2, "v_two", init_slots)
         one_const = self.scratch_const(1, slots=init_slots)
@@ -275,12 +274,13 @@ class KernelBuilder:
         hash_mul_vecs = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             hash_vec_consts1.append(self.scratch_vconst(val1, slots=init_slots))
-            hash_vec_consts3.append(self.scratch_vconst(val3, slots=init_slots))
             if op1 == "+" and op2 == "+" and op3 == "<<":
+                hash_vec_consts3.append(None)
                 hash_mul_vecs.append(
                     self.scratch_vconst(1 + (1 << val3), slots=init_slots)
                 )
             else:
+                hash_vec_consts3.append(self.scratch_vconst(val3, slots=init_slots))
                 hash_mul_vecs.append(None)
 
         assert batch_size % VLEN == 0
@@ -588,8 +588,7 @@ class KernelBuilder:
 
                         # Index update
                         if level == forest_height:
-                            # Wrap to 0 at leaf level
-                            slots.append(("valu", ("+", idx_vec, zero_vec, zero_vec)))
+                            slots.append(("valu", ("^", idx_vec, idx_vec, idx_vec)))
                         else:
                             for lane in range(VLEN):
                                 slots.append(
