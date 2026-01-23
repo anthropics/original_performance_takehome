@@ -48,13 +48,6 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
-
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
@@ -67,6 +60,9 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
+    def alloc_vec(self, name=None):
+        return self.alloc_scratch(name, VLEN)
+
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
@@ -74,28 +70,13 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
-
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
+    def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Aggressively pipelined kernel: interleave A and B to overlap load/valu.
         """
         tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+
+        # Allocate and load header variables
         init_vars = [
             "rounds",
             "n_nodes",
@@ -111,77 +92,389 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
+        # Scalar constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        vlen_const = self.scratch_const(VLEN)
+        vlen2_const = self.scratch_const(2 * VLEN)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        # Vector registers for batch A
+        v_idx_A = self.alloc_vec("v_idx_A")
+        v_val_A = self.alloc_vec("v_val_A")
+        v_node_val_A = self.alloc_vec("v_node_val_A")
+        v_tmp_A1 = self.alloc_vec("v_tmp_A1")
+        v_tmp_A2 = self.alloc_vec("v_tmp_A2")
+
+        # Vector registers for batch B
+        v_idx_B = self.alloc_vec("v_idx_B")
+        v_val_B = self.alloc_vec("v_val_B")
+        v_node_val_B = self.alloc_vec("v_node_val_B")
+        v_tmp_B1 = self.alloc_vec("v_tmp_B1")
+        v_tmp_B2 = self.alloc_vec("v_tmp_B2")
+
+        # Vector constants
+        v_zero = self.alloc_vec("v_zero")
+        v_one = self.alloc_vec("v_one")
+        v_two = self.alloc_vec("v_two")
+        v_n_nodes = self.alloc_vec("v_n_nodes")
+        v_fvp = self.alloc_vec("v_fvp")
+
+        # Scalar tree addresses for A and B
+        tree_addrs_A = [self.alloc_scratch(f"ta_A{i}") for i in range(VLEN)]
+        tree_addrs_B = [self.alloc_scratch(f"ta_B{i}") for i in range(VLEN)]
+
+        # Loop counters and base pointers
+        round_ctr = self.alloc_scratch("round_ctr")
+        batch_ctr = self.alloc_scratch("batch_ctr")
+        idx_base_A = self.alloc_scratch("idx_base_A")
+        val_base_A = self.alloc_scratch("val_base_A")
+        idx_base_B = self.alloc_scratch("idx_base_B")
+        val_base_B = self.alloc_scratch("val_base_B")
+
+        # Hash constant vectors
+        hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            vc1 = self.alloc_vec(f"hc1_{hi}")
+            vc3 = self.alloc_vec(f"hc3_{hi}")
+            c1 = self.scratch_const(val1)
+            c3 = self.scratch_const(val3)
+            hash_consts.append((vc1, vc3, op1, op2, op3, c1, c3))
+
+        # Broadcast hash constants (6 per cycle)
+        for i in range(0, len(hash_consts), 3):
+            slots = []
+            for j in range(i, min(i + 3, len(hash_consts))):
+                vc1, vc3, _, _, _, c1, c3 = hash_consts[j]
+                slots.append(("vbroadcast", vc1, c1))
+                slots.append(("vbroadcast", vc3, c3))
+            self.instrs.append({"valu": slots})
+
+        # Broadcast basic vector constants
+        self.instrs.append(
+            {
+                "valu": [
+                    ("vbroadcast", v_zero, zero_const),
+                    ("vbroadcast", v_one, one_const),
+                    ("vbroadcast", v_two, two_const),
+                    ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+                    ("vbroadcast", v_fvp, self.scratch["forest_values_p"]),
+                ]
+            }
+        )
+
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        self.add("load", ("const", round_ctr, 0))
 
-        body = []  # array of slots
+        # === Outer loop (rounds) ===
+        outer_loop_start = len(self.instrs)
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Reset counters and bases
+        self.instrs.append(
+            {
+                "load": [("const", batch_ctr, 0)],
+                "alu": [
+                    (
+                        "+",
+                        idx_base_A,
+                        self.scratch["inp_indices_p"],
+                        zero_const,
+                    ),
+                    (
+                        "+",
+                        val_base_A,
+                        self.scratch["inp_values_p"],
+                        zero_const,
+                    ),
+                ],
+            }
+        )
+        self.instrs.append(
+            {
+                "alu": [
+                    ("+", idx_base_B, idx_base_A, vlen_const),
+                    ("+", val_base_B, val_base_A, vlen_const),
+                ]
+            }
+        )
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        # === Inner loop: interleaved A and B ===
+        inner_loop_start = len(self.instrs)
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+        # PHASE 1: Load A idx/val (2 loads)
+        self.instrs.append(
+            {
+                "load": [
+                    ("vload", v_idx_A, idx_base_A),
+                    ("vload", v_val_A, val_base_A),
+                ]
+            }
+        )
+
+        # PHASE 2: Compute A addresses (valu)
+        self.add("valu", ("+", v_tmp_A1, v_idx_A, v_fvp))
+
+        # PHASE 3: Copy A addresses (alu, 8 ops)
+        self.instrs.append(
+            {
+                "alu": [
+                    ("+", tree_addrs_A[i], v_tmp_A1 + i, zero_const)
+                    for i in range(VLEN)
+                ]
+            }
+        )
+
+        # PHASE 4-7: Load A tree values (4 cycles)
+        for i in range(0, VLEN, 2):
+            self.instrs.append(
+                {
+                    "load": [
+                        ("load", v_node_val_A + i, tree_addrs_A[i]),
+                        ("load", v_node_val_A + i + 1, tree_addrs_A[i + 1]),
+                    ]
+                }
+            )
+
+        # PHASE 8: A XOR
+        self.add("valu", ("^", v_val_A, v_val_A, v_node_val_A))
+
+        # PHASE 9-20: A hash (12 cycles) - interleave with B setup
+        # Hash stage 0 + B load
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[0]
+        self.instrs.append(
+            {
+                "valu": [
+                    (op1, v_tmp_A1, v_val_A, vc1),
+                    (op3, v_tmp_A2, v_val_A, vc3),
+                ],
+                "load": [
+                    ("vload", v_idx_B, idx_base_B),
+                    ("vload", v_val_B, val_base_B),
+                ],
+            }
+        )
+        self.add("valu", (op2, v_val_A, v_tmp_A1, v_tmp_A2))
+
+        # Hash stage 1 + B address compute
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[1]
+        self.instrs.append(
+            {
+                "valu": [
+                    (op1, v_tmp_A1, v_val_A, vc1),
+                    (op3, v_tmp_A2, v_val_A, vc3),
+                    ("+", v_tmp_B1, v_idx_B, v_fvp),
+                ]
+            }
+        )
+        self.add("valu", (op2, v_val_A, v_tmp_A1, v_tmp_A2))
+
+        # Hash stage 2 + B address copy
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[2]
+        self.instrs.append(
+            {
+                "valu": [
+                    (op1, v_tmp_A1, v_val_A, vc1),
+                    (op3, v_tmp_A2, v_val_A, vc3),
+                ],
+                "alu": [
+                    ("+", tree_addrs_B[i], v_tmp_B1 + i, zero_const)
+                    for i in range(VLEN)
+                ],
+            }
+        )
+        self.add("valu", (op2, v_val_A, v_tmp_A1, v_tmp_A2))
+
+        # Hash stage 3 + B tree loads [0:2]
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[3]
+        self.instrs.append(
+            {
+                "valu": [
+                    (op1, v_tmp_A1, v_val_A, vc1),
+                    (op3, v_tmp_A2, v_val_A, vc3),
+                ],
+                "load": [
+                    ("load", v_node_val_B + 0, tree_addrs_B[0]),
+                    ("load", v_node_val_B + 1, tree_addrs_B[1]),
+                ],
+            }
+        )
+        self.instrs.append(
+            {
+                "valu": [(op2, v_val_A, v_tmp_A1, v_tmp_A2)],
+                "load": [
+                    ("load", v_node_val_B + 2, tree_addrs_B[2]),
+                    ("load", v_node_val_B + 3, tree_addrs_B[3]),
+                ],
+            }
+        )
+
+        # Hash stage 4 + B tree loads [4:6]
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[4]
+        self.instrs.append(
+            {
+                "valu": [
+                    (op1, v_tmp_A1, v_val_A, vc1),
+                    (op3, v_tmp_A2, v_val_A, vc3),
+                ],
+                "load": [
+                    ("load", v_node_val_B + 4, tree_addrs_B[4]),
+                    ("load", v_node_val_B + 5, tree_addrs_B[5]),
+                ],
+            }
+        )
+        self.instrs.append(
+            {
+                "valu": [(op2, v_val_A, v_tmp_A1, v_tmp_A2)],
+                "load": [
+                    ("load", v_node_val_B + 6, tree_addrs_B[6]),
+                    ("load", v_node_val_B + 7, tree_addrs_B[7]),
+                ],
+            }
+        )
+
+        # Hash stage 5
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[5]
+        self.instrs.append(
+            {
+                "valu": [
+                    (op1, v_tmp_A1, v_val_A, vc1),
+                    (op3, v_tmp_A2, v_val_A, vc3),
+                ]
+            }
+        )
+        self.add("valu", (op2, v_val_A, v_tmp_A1, v_tmp_A2))
+
+        # PHASE 21-26: A index update + B XOR + B early hash
+        self.instrs.append(
+            {
+                "valu": [
+                    ("&", v_tmp_A1, v_val_A, v_one),
+                    ("*", v_idx_A, v_idx_A, v_two),
+                    ("^", v_val_B, v_val_B, v_node_val_B),
+                ]
+            }
+        )
+        self.add("valu", ("==", v_tmp_A1, v_tmp_A1, v_zero))
+
+        # A vselect + B hash 0 first
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[0]
+        self.instrs.append(
+            {
+                "flow": [("vselect", v_tmp_A2, v_tmp_A1, v_one, v_two)],
+                "valu": [
+                    (op1, v_tmp_B1, v_val_B, vc1),
+                    (op3, v_tmp_B2, v_val_B, vc3),
+                ],
+            }
+        )
+
+        # A (+) + B hash 0 second
+        self.instrs.append(
+            {
+                "valu": [
+                    ("+", v_idx_A, v_idx_A, v_tmp_A2),
+                    (op2, v_val_B, v_tmp_B1, v_tmp_B2),
+                ]
+            }
+        )
+
+        # A (<) + B hash 1 first
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[1]
+        self.instrs.append(
+            {
+                "valu": [
+                    ("<", v_tmp_A1, v_idx_A, v_n_nodes),
+                    (op1, v_tmp_B1, v_val_B, vc1),
+                    (op3, v_tmp_B2, v_val_B, vc3),
+                ]
+            }
+        )
+
+        # A final vselect + B hash 1 second
+        self.instrs.append(
+            {
+                "flow": [("vselect", v_idx_A, v_tmp_A1, v_idx_A, v_zero)],
+                "valu": [(op2, v_val_B, v_tmp_B1, v_tmp_B2)],
+            }
+        )
+
+        # PHASE 27: Store A + B hash 2
+        vc1, vc3, op1, op2, op3, _, _ = hash_consts[2]
+        self.instrs.append(
+            {
+                "store": [
+                    ("vstore", idx_base_A, v_idx_A),
+                    ("vstore", val_base_A, v_val_A),
+                ],
+                "valu": [
+                    (op1, v_tmp_B1, v_val_B, vc1),
+                    (op3, v_tmp_B2, v_val_B, vc3),
+                ],
+            }
+        )
+        self.add("valu", (op2, v_val_B, v_tmp_B1, v_tmp_B2))
+
+        # PHASE 28-39: B hash stages 3-5 (6 cycles)
+        for vc1, vc3, op1, op2, op3, _, _ in hash_consts[3:]:
+            self.instrs.append(
+                {
+                    "valu": [
+                        (op1, v_tmp_B1, v_val_B, vc1),
+                        (op3, v_tmp_B2, v_val_B, vc3),
+                    ]
+                }
+            )
+            self.add("valu", (op2, v_val_B, v_tmp_B1, v_tmp_B2))
+
+        # PHASE 40-45: B index update
+        self.instrs.append(
+            {
+                "valu": [
+                    ("&", v_tmp_B1, v_val_B, v_one),
+                    ("*", v_idx_B, v_idx_B, v_two),
+                ]
+            }
+        )
+        self.add("valu", ("==", v_tmp_B1, v_tmp_B1, v_zero))
+        self.add("flow", ("vselect", v_tmp_B2, v_tmp_B1, v_one, v_two))
+        self.add("valu", ("+", v_idx_B, v_idx_B, v_tmp_B2))
+        self.add("valu", ("<", v_tmp_B1, v_idx_B, v_n_nodes))
+        self.add("flow", ("vselect", v_idx_B, v_tmp_B1, v_idx_B, v_zero))
+
+        # Store B + update counters
+        self.instrs.append(
+            {
+                "store": [
+                    ("vstore", idx_base_B, v_idx_B),
+                    ("vstore", val_base_B, v_val_B),
+                ],
+                "alu": [
+                    ("+", batch_ctr, batch_ctr, vlen2_const),
+                    ("+", idx_base_A, idx_base_A, vlen2_const),
+                    ("+", val_base_A, val_base_A, vlen2_const),
+                    ("+", idx_base_B, idx_base_B, vlen2_const),
+                    ("+", val_base_B, val_base_B, vlen2_const),
+                ],
+            }
+        )
+
+        # Inner loop check
+        self.add("alu", ("<", tmp1, batch_ctr, self.scratch["batch_size"]))
+        self.add("flow", ("cond_jump", tmp1, inner_loop_start))
+
+        # Outer loop update
+        self.add("flow", ("add_imm", round_ctr, round_ctr, 1))
+        self.add("alu", ("<", tmp1, round_ctr, self.scratch["rounds"]))
+        self.add("flow", ("cond_jump", tmp1, outer_loop_start))
+
         self.instrs.append({"flow": [("pause",)]})
+
 
 BASELINE = 147734
 
+
 def do_kernel_test(
-    forest_height: int,
-    rounds: int,
-    batch_size: int,
-    seed: int = 123,
-    trace: bool = False,
-    prints: bool = False,
+    forest_height, rounds, batch_size, seed=123, trace=False, prints=False
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -190,8 +483,9 @@ def do_kernel_test(
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
+    kb.build_kernel(
+        forest.height, len(forest.values), len(inp.indices), rounds
+    )
 
     value_trace = {}
     machine = Machine(
@@ -215,10 +509,10 @@ def do_kernel_test(
         ), f"Incorrect result on round {i}"
         inp_indices_p = ref_mem[5]
         if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+            print(
+                machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+            )
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -227,9 +521,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -242,34 +533,11 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
