@@ -6,6 +6,7 @@ reference kernel for testing.
 """
 
 from copy import copy
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
@@ -115,6 +116,9 @@ class Machine:
         self.cycle = 0
         self.enable_pause = True
         self.enable_debug = True
+        self.profile = False
+        self.slot_counts = defaultdict(int)
+        self.bundle_counts = defaultdict(int)
         if trace:
             self.setup_trace()
         else:
@@ -360,6 +364,12 @@ class Machine:
             "store": self.store,
             "flow": self.flow,
         }
+        if self.profile:
+            for name, slots in instr.items():
+                if name == "debug":
+                    continue
+                self.bundle_counts[name] += 1
+                self.slot_counts[name] += len(slots)
         self.scratch_write = {}
         self.mem_write = {}
         for name, slots in instr.items():
@@ -400,6 +410,15 @@ class Machine:
         if self.trace is not None:
             self.trace.write("]")
             self.trace.close()
+        if self.profile:
+            print("=== Slot Profile ===")
+            for name in sorted(self.slot_counts.keys()):
+                slots = self.slot_counts[name]
+                bundles = self.bundle_counts.get(name, 0)
+                avg = slots / bundles if bundles else 0
+                print(
+                    f"{name}: slots={slots} bundles={bundles} avg_slots_per_bundle={avg:.2f}"
+                )
 
 
 @dataclass
