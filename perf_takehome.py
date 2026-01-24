@@ -113,6 +113,12 @@ class KernelBuilder:
     def build_hash_vec(self, val_vec, tmp1_vec, tmp2_vec, round, base):
         slots = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op2 == "+" and op1 == "+" and op3 == "<<":
+                # (a + val1) + (a << k) == a * (1 + 2^k) + val1
+                mul = self.scratch_vconst(1 + (1 << val3))
+                add = self.scratch_vconst(val1)
+                slots.append(("valu", ("multiply_add", val_vec, val_vec, mul, add)))
+                continue
             c1 = self.scratch_vconst(val1)
             c3 = self.scratch_vconst(val3)
             slots.append(("valu", (op1, tmp1_vec, val_vec, c1)))
@@ -173,69 +179,122 @@ class KernelBuilder:
         tmp_addr = self.alloc_scratch("tmp_addr")
 
         if _env_flag("VEC"):
-            vec_idx = self.alloc_scratch("vec_idx", length=VLEN)
-            vec_val = self.alloc_scratch("vec_val", length=VLEN)
-            vec_node = self.alloc_scratch("vec_node", length=VLEN)
+            # Unroll factor for vector chunks (1, 2, 4, 8)
+            if _env_flag("VEC2"):
+                unroll = 2
+            elif _env_flag("VEC4"):
+                unroll = 4
+            else:
+                try:
+                    unroll = int(os.getenv("VEC_UNROLL", "1"))
+                except ValueError:
+                    unroll = 1
+            if unroll not in (1, 2, 4, 8):
+                unroll = 1
+
             vec_tmp1 = self.alloc_scratch("vec_tmp1", length=VLEN)
             vec_tmp2 = self.alloc_scratch("vec_tmp2", length=VLEN)
             vec_tmp3 = self.alloc_scratch("vec_tmp3", length=VLEN)
-            vec_addr = self.alloc_scratch("vec_addr", length=VLEN)
+
+            vec_idx_u = []
+            vec_val_u = []
+            vec_node_u = []
+            vec_addr_u = []
+            vec_addr_idx_u = []
+            vec_addr_val_u = []
+            for ui in range(unroll):
+                vec_idx_u.append(self.alloc_scratch(f"vec_idx_{ui}", length=VLEN))
+                vec_val_u.append(self.alloc_scratch(f"vec_val_{ui}", length=VLEN))
+                vec_node_u.append(self.alloc_scratch(f"vec_node_{ui}", length=VLEN))
+                vec_addr_u.append(self.alloc_scratch(f"vec_addr_{ui}", length=VLEN))
+                vec_addr_idx_u.append(self.alloc_scratch(f"vec_addr_idx_{ui}"))
+                vec_addr_val_u.append(self.alloc_scratch(f"vec_addr_val_{ui}"))
             vec_zero = self.scratch_vconst(0)
             vec_one = self.scratch_vconst(1)
             vec_two = self.scratch_vconst(2)
             vec_n_nodes = self.scratch_vbroadcast(self.scratch["n_nodes"])
+            vec_forest_base = self.scratch_vbroadcast(self.scratch["forest_values_p"])
 
             for round in range(rounds):
                 vec_limit = (batch_size // VLEN) * VLEN
-                for base in range(0, vec_limit, VLEN):
-                    base_const = self.scratch_const(base)
-                    # vload idx/val
-                    body.append(
-                        ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], base_const))
-                    )
-                    body.append(("load", ("vload", vec_idx, tmp_addr)))
-                    body.append(
-                        ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_const))
-                    )
-                    body.append(("load", ("vload", vec_val, tmp_addr)))
-                    # gather node values (scalar loads via per-lane address)
-                    for lane in range(VLEN):
-                        body.append(
-                            (
-                                "alu",
+                if unroll > 0:
+                    for base in range(0, vec_limit, VLEN * unroll):
+                        # address setup
+                        for ui in range(unroll):
+                            base_u = base + ui * VLEN
+                            if base_u >= vec_limit:
+                                continue
+                            base_u_const = self.scratch_const(base_u)
+                            body.append(
                                 (
-                                    "+",
-                                    vec_addr + lane,
-                                    self.scratch["forest_values_p"],
-                                    vec_idx + lane,
-                                ),
+                                    "alu",
+                                    (
+                                        "+",
+                                        vec_addr_idx_u[ui],
+                                        self.scratch["inp_indices_p"],
+                                        base_u_const,
+                                    ),
+                                )
                             )
-                        )
-                    for lane in range(VLEN):
-                        body.append(
-                            ("load", ("load_offset", vec_node, vec_addr, lane))
-                        )
-                    # val ^= node
-                    body.append(("valu", ("^", vec_val, vec_val, vec_node)))
-                    body.extend(self.build_hash_vec(vec_val, vec_tmp1, vec_tmp2, round, base))
-                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                    body.append(("valu", ("%", vec_tmp1, vec_val, vec_two)))
-                    body.append(("valu", ("==", vec_tmp1, vec_tmp1, vec_zero)))
-                    body.append(("flow", ("vselect", vec_tmp3, vec_tmp1, vec_one, vec_two)))
-                    body.append(("valu", ("*", vec_idx, vec_idx, vec_two)))
-                    body.append(("valu", ("+", vec_idx, vec_idx, vec_tmp3)))
-                    # idx = 0 if idx >= n_nodes else idx
-                    body.append(("valu", ("<", vec_tmp1, vec_idx, vec_n_nodes)))
-                    body.append(("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, vec_zero)))
-                    # store back
-                    body.append(
-                        ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], base_const))
-                    )
-                    body.append(("store", ("vstore", tmp_addr, vec_idx)))
-                    body.append(
-                        ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_const))
-                    )
-                    body.append(("store", ("vstore", tmp_addr, vec_val)))
+                            body.append(
+                                (
+                                    "alu",
+                                    (
+                                        "+",
+                                        vec_addr_val_u[ui],
+                                        self.scratch["inp_values_p"],
+                                        base_u_const,
+                                    ),
+                                )
+                            )
+
+                        # vload idx/val
+                        for ui in range(unroll):
+                            base_u = base + ui * VLEN
+                            if base_u >= vec_limit:
+                                continue
+                            body.append(("load", ("vload", vec_idx_u[ui], vec_addr_idx_u[ui])))
+                            body.append(("load", ("vload", vec_val_u[ui], vec_addr_val_u[ui])))
+
+                        # gather node values
+                        for ui in range(unroll):
+                            base_u = base + ui * VLEN
+                            if base_u >= vec_limit:
+                                continue
+                            body.append(
+                                ("valu", ("+", vec_addr_u[ui], vec_forest_base, vec_idx_u[ui]))
+                            )
+                            for lane in range(VLEN):
+                                body.append(
+                                    ("load", ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane))
+                                )
+
+                        # process each vector
+                        for ui in range(unroll):
+                            base_u = base + ui * VLEN
+                            if base_u >= vec_limit:
+                                continue
+                            body.append(
+                                ("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]))
+                            )
+                            body.extend(
+                                self.build_hash_vec(
+                                    vec_val_u[ui], vec_tmp1, vec_tmp2, round, base_u
+                                )
+                            )
+                            body.append(("valu", ("%", vec_tmp1, vec_val_u[ui], vec_two)))
+                            body.append(("valu", ("==", vec_tmp1, vec_tmp1, vec_zero)))
+                            body.append(
+                                ("flow", ("vselect", vec_tmp3, vec_tmp1, vec_one, vec_two))
+                            )
+                            body.append(("valu", ("*", vec_idx_u[ui], vec_idx_u[ui], vec_two)))
+                            body.append(("valu", ("+", vec_idx_u[ui], vec_idx_u[ui], vec_tmp3)))
+                            body.append(("valu", ("<", vec_tmp1, vec_idx_u[ui], vec_n_nodes)))
+                            body.append(
+                                ("flow", ("vselect", vec_idx_u[ui], vec_tmp1, vec_idx_u[ui], vec_zero))
+                            )
+                            body.append(("store", ("vstore", vec_addr_idx_u[ui], vec_idx_u[ui])))
+                            body.append(("store", ("vstore", vec_addr_val_u[ui], vec_val_u[ui])))
                 # tail (scalar)
                 for i in range(vec_limit, batch_size):
                     i_const = self.scratch_const(i)
@@ -344,6 +403,8 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
+    if _env_flag("PROFILE"):
+        machine.profile = True
     for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
         machine.run()
         inp_values_p = ref_mem[6]
