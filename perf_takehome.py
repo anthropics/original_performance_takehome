@@ -18,6 +18,7 @@ We recommend you look through problem.py next.
 
 from collections import defaultdict
 import argparse
+import os
 import sys
 import random
 import unittest
@@ -53,6 +54,8 @@ class KernelBuilder:
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         # Simple slot packing that just uses one slot per instruction bundle
+        if _env_flag("VLIW"):
+            vliw = True
         if not vliw:
             instrs = []
             for engine, slot in slots:
@@ -195,6 +198,8 @@ def do_kernel_test(
     prints: bool = False,
     vliw: bool = False,
 ):
+    if _env_flag("VLIW"):
+        vliw = True
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
     forest = Tree.generate(forest_height)
@@ -251,13 +256,17 @@ def _parse_args():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--prints", action="store_true")
-    parser.add_argument("--vliw", action="store_true")
     parser.add_argument(
         "--compare",
         action="store_true",
         help="Run baseline and VLIW back-to-back with the same parameters.",
     )
     return parser.parse_args()
+
+
+def _env_flag(name: str) -> bool:
+    val = os.getenv(name, "").strip().lower()
+    return val in {"1", "true", "yes", "y", "on"}
 
 
 class Tests(unittest.TestCase):
@@ -295,6 +304,7 @@ class Tests(unittest.TestCase):
 
 def _main():
     args = _parse_args()
+    vliw = _env_flag("VLIW")
     if args.compare:
         print("== Baseline ==")
         do_kernel_test(
@@ -324,7 +334,7 @@ def _main():
             seed=args.seed,
             trace=args.trace,
             prints=args.prints,
-            vliw=args.vliw,
+            vliw=vliw,
         )
 
 
@@ -336,7 +346,6 @@ def _has_cli_args(argv: list[str]) -> bool:
         "--seed",
         "--trace",
         "--prints",
-        "--vliw",
         "--compare",
     }
     return any(arg in cli_flags for arg in argv[1:])
