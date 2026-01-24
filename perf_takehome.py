@@ -17,6 +17,8 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+import argparse
+import sys
 import random
 import unittest
 
@@ -35,6 +37,7 @@ from problem import (
     build_mem_image,
     reference_kernel2,
 )
+from vliw_scheduler import schedule_slots
 
 
 class KernelBuilder:
@@ -50,10 +53,12 @@ class KernelBuilder:
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+        if not vliw:
+            instrs = []
+            for engine, slot in slots:
+                instrs.append({engine: [slot]})
+            return instrs
+        return schedule_slots(slots, SLOT_LIMITS)
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -86,7 +91,13 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self,
+        forest_height: int,
+        n_nodes: int,
+        batch_size: int,
+        rounds: int,
+        *,
+        vliw: bool = False,
     ):
         """
         Like reference_kernel2 but building actual instructions.
@@ -168,7 +179,7 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                 body.append(("store", ("store", tmp_addr, tmp_val)))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build(body, vliw=vliw)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
@@ -182,6 +193,7 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
+    vliw: bool = False,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -190,7 +202,13 @@ def do_kernel_test(
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    kb.build_kernel(
+        forest.height,
+        len(forest.values),
+        len(inp.indices),
+        rounds,
+        vliw=vliw,
+    )
     # print(kb.instrs)
 
     value_trace = {}
@@ -223,6 +241,23 @@ def do_kernel_test(
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
     return machine.cycle
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Run kernel test.")
+    parser.add_argument("--forest-height", type=int, default=10)
+    parser.add_argument("--rounds", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--prints", action="store_true")
+    parser.add_argument("--vliw", action="store_true")
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Run baseline and VLIW back-to-back with the same parameters.",
+    )
+    return parser.parse_args()
 
 
 class Tests(unittest.TestCase):
@@ -258,6 +293,55 @@ class Tests(unittest.TestCase):
         do_kernel_test(10, 16, 256)
 
 
+def _main():
+    args = _parse_args()
+    if args.compare:
+        print("== Baseline ==")
+        do_kernel_test(
+            args.forest_height,
+            args.rounds,
+            args.batch_size,
+            seed=args.seed,
+            trace=args.trace,
+            prints=args.prints,
+            vliw=False,
+        )
+        print("== VLIW ==")
+        do_kernel_test(
+            args.forest_height,
+            args.rounds,
+            args.batch_size,
+            seed=args.seed,
+            trace=args.trace,
+            prints=args.prints,
+            vliw=True,
+        )
+    else:
+        do_kernel_test(
+            args.forest_height,
+            args.rounds,
+            args.batch_size,
+            seed=args.seed,
+            trace=args.trace,
+            prints=args.prints,
+            vliw=args.vliw,
+        )
+
+
+def _has_cli_args(argv: list[str]) -> bool:
+    cli_flags = {
+        "--forest-height",
+        "--rounds",
+        "--batch-size",
+        "--seed",
+        "--trace",
+        "--prints",
+        "--vliw",
+        "--compare",
+    }
+    return any(arg in cli_flags for arg in argv[1:])
+
+
 # To run all the tests:
 #    python perf_takehome.py
 # To run a specific test:
@@ -272,4 +356,7 @@ class Tests(unittest.TestCase):
 #    python tests/submission_tests.py
 
 if __name__ == "__main__":
-    unittest.main()
+    if _has_cli_args(sys.argv):
+        _main()
+    else:
+        unittest.main()
