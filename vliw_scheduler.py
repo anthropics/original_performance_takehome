@@ -13,6 +13,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+from problem import VLEN
 
 # Slot is (engine, payload)
 Slot = Tuple[str, Tuple]
@@ -57,7 +58,7 @@ def _slot_deps(engine: str, slot: Tuple) -> SlotDeps:
     writes: set[int] = set()
     is_mem = False
 
-    if engine in ("alu", "valu"):
+    if engine == "alu":
         # (op, dest, a1, a2)
         if op in ("~",):  # unary ops if any
             _, dest, a1 = slot
@@ -67,6 +68,23 @@ def _slot_deps(engine: str, slot: Tuple) -> SlotDeps:
             _, dest, a1, a2 = slot
             reads.update((a1, a2))
             writes.add(dest)
+    elif engine == "valu":
+        # Vector ops: treat ranges of VLEN scratch addresses.
+        if op == "vbroadcast":
+            _, dest, src = slot
+            reads.add(src)
+            writes.update(range(dest, dest + VLEN))
+        elif op == "multiply_add":
+            _, dest, a, b, c = slot
+            reads.update(range(a, a + VLEN))
+            reads.update(range(b, b + VLEN))
+            reads.update(range(c, c + VLEN))
+            writes.update(range(dest, dest + VLEN))
+        else:
+            _, dest, a1, a2 = slot
+            reads.update(range(a1, a1 + VLEN))
+            reads.update(range(a2, a2 + VLEN))
+            writes.update(range(dest, dest + VLEN))
     elif engine == "load":
         if op == "const":
             _, dest, _val = slot
@@ -77,17 +95,14 @@ def _slot_deps(engine: str, slot: Tuple) -> SlotDeps:
             writes.add(dest)
             is_mem = True
         elif op == "vload":
-            # ("vload", dest_vec, addr) or ("vload", dest_vec, addr, mask)
-            # Read addr (and mask if present), write dest vector base.
+            # ("vload", dest_vec, addr)
             reads.add(slot[2])
-            if len(slot) > 3:
-                reads.add(slot[3])
-            writes.add(slot[1])
+            writes.update(range(slot[1], slot[1] + VLEN))
             is_mem = True
         elif op == "vbroadcast":
             _, dest_vec, src = slot
             reads.add(src)
-            writes.add(dest_vec)
+            writes.update(range(dest_vec, dest_vec + VLEN))
         else:
             # Unknown load op; be conservative.
             for v in slot[1:]:
@@ -100,11 +115,9 @@ def _slot_deps(engine: str, slot: Tuple) -> SlotDeps:
             reads.update((addr, src))
             is_mem = True
         elif op == "vstore":
-            # ("vstore", addr, src_vec) or ("vstore", addr, src_vec, mask)
+            # ("vstore", addr, src_vec)
             reads.add(slot[1])
-            reads.add(slot[2])
-            if len(slot) > 3:
-                reads.add(slot[3])
+            reads.update(range(slot[2], slot[2] + VLEN))
             is_mem = True
         else:
             for v in slot[1:]:
@@ -123,6 +136,12 @@ def _slot_deps(engine: str, slot: Tuple) -> SlotDeps:
             if op == "jump_if":
                 _, cond, _target = slot
                 reads.add(cond)
+        elif op == "vselect":
+            _, dest, cond, a, b = slot
+            reads.update(range(cond, cond + VLEN))
+            reads.update(range(a, a + VLEN))
+            reads.update(range(b, b + VLEN))
+            writes.update(range(dest, dest + VLEN))
         else:
             # Unknown flow op; be conservative.
             for v in slot[1:]:
