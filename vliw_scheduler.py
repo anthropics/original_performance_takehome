@@ -196,6 +196,7 @@ def schedule_slots(
     slot_limits: Dict[str, int],
     *,
     serialize_mem: bool = False,
+    window: int = 256,
 ) -> List[Dict[str, List[Tuple]]]:
     """
     Schedule a sequence of slots into VLIW bundles.
@@ -298,6 +299,7 @@ def schedule_slots(
     bundles: List[Dict[str, List[Tuple]]] = []
 
     engine_priority = ["load", "store", "alu", "valu", "flow", "debug"]
+    engine_weights = {"valu": 3, "load": 2, "store": 1, "alu": 1, "flow": 1, "debug": 0}
 
     while scheduled < n:
         bundle: Dict[str, List[Tuple]] = {}
@@ -305,21 +307,24 @@ def schedule_slots(
         picked: List[int] = []
 
         ready_list = list(ready)
+        if window and len(ready_list) > window:
+            ready_list = ready_list[:window]
         picked_set = set()
 
-        # Fill each engine from the ready set, ignoring original order when possible.
+        # Fill each engine from the ready set with a weighted preference.
         for engine in engine_priority:
             limit = slot_limits.get(engine, 0)
             if limit == 0:
                 continue
-            for idx in ready_list:
+            candidates = [
+                idx
+                for idx in ready_list
+                if idx not in picked_set and slots[idx][0] == engine
+            ]
+            for idx in candidates:
                 if used[engine] >= limit:
                     break
-                if idx in picked_set:
-                    continue
                 slot_engine, slot = slots[idx]
-                if slot_engine != engine:
-                    continue
                 bundle.setdefault(engine, []).append(slot)
                 used[engine] += 1
                 picked.append(idx)
@@ -333,8 +338,8 @@ def schedule_slots(
             picked.append(i)
             picked_set.add(i)
 
-        # Rebuild ready deque without picked items, preserving order.
-        ready = deque(i for i in ready_list if i not in picked_set)
+        # Rebuild ready deque without picked items, preserving original order.
+        ready = deque(i for i in ready if i not in picked_set)
 
         bundles.append(bundle)
         scheduled += len(picked)
