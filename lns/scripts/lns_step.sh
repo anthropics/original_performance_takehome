@@ -28,6 +28,9 @@ else
     MAX_ITERATIONS=100
 fi
 
+# Stagnation-based escape config (Policy C)
+STAGNANT_THRESHOLD=${STAGNANT_THRESHOLD:-3}
+
 STATE_FILE="$LNS_DIR/candidates/state.txt"
 OPERATORS_FILE="$LNS_DIR/operators.txt"
 
@@ -125,6 +128,7 @@ ITERATION=0
 PHASE=kick
 CURRENT_SCORE=$INITIAL_SCORE
 BEST_SCORE=$INITIAL_SCORE
+STAGNANT_COUNT=0
 EOF
 
     # Copy to BEST
@@ -148,30 +152,65 @@ if [ -n "$AGENT_OUTPUT" ]; then
         PHASE="refine"
         echo "[KICK] Complete, transitioning to refine"
     elif [ "$PHASE" = "refine" ]; then
-        # Refine just finished - evaluate and accept
+        # Refine just finished - evaluate with greedy acceptance + stagnation escape
         NEIGHBOR_SCORE=$("$PROJECT_ROOT/scripts/eval_candidate.sh" lns NEIGHBOR 2>/dev/null || echo "ERROR")
         CURRENT_SCORE=$(get_state CURRENT_SCORE)
         BEST_SCORE=$(get_state BEST_SCORE)
+        STAGNANT_COUNT=$(get_state STAGNANT_COUNT)
+        STAGNANT_COUNT=${STAGNANT_COUNT:-0}
 
         # Validate NEIGHBOR_SCORE is a valid integer
         if [ "$NEIGHBOR_SCORE" != "ERROR" ] && [[ "$NEIGHBOR_SCORE" =~ ^[0-9]+$ ]]; then
-            # Accept neighbor as new current
-            rm -rf "$LNS_DIR/candidates/CAND_CURRENT"
-            mv "$LNS_DIR/candidates/CAND_NEIGHBOR" "$LNS_DIR/candidates/CAND_CURRENT"
-            set_state CURRENT_SCORE "$NEIGHBOR_SCORE"
-            echo "[ACCEPT] New current: $NEIGHBOR_SCORE cycles"
+            # GREEDY: Only accept if improved over current
+            if [ "$NEIGHBOR_SCORE" -lt "$CURRENT_SCORE" ]; then
+                rm -rf "$LNS_DIR/candidates/CAND_CURRENT"
+                mv "$LNS_DIR/candidates/CAND_NEIGHBOR" "$LNS_DIR/candidates/CAND_CURRENT"
+                set_state CURRENT_SCORE "$NEIGHBOR_SCORE"
+                echo "[ACCEPT] Improved: $NEIGHBOR_SCORE cycles (was $CURRENT_SCORE)"
 
-            # Update best if improved
-            if [ "$NEIGHBOR_SCORE" -lt "$BEST_SCORE" ]; then
-                rm -rf "$LNS_DIR/candidates/CAND_BEST"
-                cp -r "$LNS_DIR/candidates/CAND_CURRENT" "$LNS_DIR/candidates/CAND_BEST"
-                set_state BEST_SCORE "$NEIGHBOR_SCORE"
-                echo "[BEST] New best: $NEIGHBOR_SCORE cycles"
+                # Reset stagnation counter on improvement
+                set_state STAGNANT_COUNT 0
+                STAGNANT_COUNT=0
+
+                # Update best if this is globally best
+                if [ "$NEIGHBOR_SCORE" -lt "$BEST_SCORE" ]; then
+                    rm -rf "$LNS_DIR/candidates/CAND_BEST"
+                    cp -r "$LNS_DIR/candidates/CAND_CURRENT" "$LNS_DIR/candidates/CAND_BEST"
+                    set_state BEST_SCORE "$NEIGHBOR_SCORE"
+                    echo "[BEST] New best: $NEIGHBOR_SCORE cycles"
+                fi
+            else
+                # No improvement - increment stagnation counter
+                rm -rf "$LNS_DIR/candidates/CAND_NEIGHBOR"
+                STAGNANT_COUNT=$((STAGNANT_COUNT + 1))
+                set_state STAGNANT_COUNT "$STAGNANT_COUNT"
+                echo "[REJECT] No improvement ($NEIGHBOR_SCORE >= $CURRENT_SCORE), stagnant=$STAGNANT_COUNT"
+
+                # ESCAPE: If stagnant for too long, restart from best with novel kick
+                if [ "$STAGNANT_COUNT" -ge "$STAGNANT_THRESHOLD" ]; then
+                    echo "[ESCAPE] Stagnation threshold reached, restarting from best"
+                    rm -rf "$LNS_DIR/candidates/CAND_CURRENT"
+                    cp -r "$LNS_DIR/candidates/CAND_BEST" "$LNS_DIR/candidates/CAND_CURRENT"
+                    set_state CURRENT_SCORE "$BEST_SCORE"
+                    set_state STAGNANT_COUNT 0
+                    set_state ESCAPE_KICK 1
+                fi
             fi
         else
-            # Evaluation failed - discard neighbor
+            # Evaluation failed - discard neighbor, count as stagnation
             rm -rf "$LNS_DIR/candidates/CAND_NEIGHBOR"
-            echo "[REJECT] Evaluation failed, keeping current"
+            STAGNANT_COUNT=$((STAGNANT_COUNT + 1))
+            set_state STAGNANT_COUNT "$STAGNANT_COUNT"
+            echo "[REJECT] Evaluation failed, stagnant=$STAGNANT_COUNT"
+
+            if [ "$STAGNANT_COUNT" -ge "$STAGNANT_THRESHOLD" ]; then
+                echo "[ESCAPE] Stagnation threshold reached, restarting from best"
+                rm -rf "$LNS_DIR/candidates/CAND_CURRENT"
+                cp -r "$LNS_DIR/candidates/CAND_BEST" "$LNS_DIR/candidates/CAND_CURRENT"
+                set_state CURRENT_SCORE "$BEST_SCORE"
+                set_state STAGNANT_COUNT 0
+                set_state ESCAPE_KICK 1
+            fi
         fi
 
         # Increment iteration and go back to kick
@@ -190,8 +229,10 @@ ITERATION=$(get_state ITERATION)
 CURRENT_SCORE=$(get_state CURRENT_SCORE)
 BEST_SCORE=$(get_state BEST_SCORE)
 PHASE=$(get_state PHASE)
+STAGNANT_COUNT=$(get_state STAGNANT_COUNT)
+STAGNANT_COUNT=${STAGNANT_COUNT:-0}
 
-echo "[STATUS] iter=$ITERATION phase=$PHASE current=$CURRENT_SCORE best=$BEST_SCORE"
+echo "[STATUS] iter=$ITERATION phase=$PHASE current=$CURRENT_SCORE best=$BEST_SCORE stagnant=$STAGNANT_COUNT/$STAGNANT_THRESHOLD"
 
 # Check if done
 if [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
@@ -206,8 +247,16 @@ if [ "$PHASE" = "kick" ]; then
     # Clean up any leftover neighbor
     rm -rf "$LNS_DIR/candidates/CAND_NEIGHBOR" 2>/dev/null || true
 
-    # Select random operator
-    OPERATOR=$(select_operator)
+    # Check if this is an escape kick (force novel after stagnation)
+    ESCAPE_KICK=$(get_state ESCAPE_KICK)
+    if [ "$ESCAPE_KICK" = "1" ]; then
+        set_state ESCAPE_KICK 0
+        echo "[ESCAPE] Forcing novel operator for big kick"
+        OPERATOR="novel"
+    else
+        # Select random operator
+        OPERATOR=$(select_operator)
+    fi
     echo "KICK_ARGS: lns CURRENT NEIGHBOR $OPERATOR"
 elif [ "$PHASE" = "refine" ]; then
     echo "REFINE_ARGS: lns NEIGHBOR NEIGHBOR"

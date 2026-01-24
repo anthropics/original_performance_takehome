@@ -7,3 +7,5 @@ strength_reduction | Replace expensive operations with cheaper equivalents
 computation_reuse | Cache and reuse intermediate results instead of recomputing
 branch_elimination | Remove conditionals using predication or arithmetic
 instruction_interleaving | Interleave independent operations to hide latency
+simd_vectorization | Use VLEN=8 vector operations (valu/vload/vstore) instead of scalar processing
+chunk_sequential_pipeline | Process each chunk through all stages before next chunk, overlapping address computation
