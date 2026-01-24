@@ -179,6 +179,7 @@ class KernelBuilder:
             vec_tmp1 = self.alloc_scratch("vec_tmp1", length=VLEN)
             vec_tmp2 = self.alloc_scratch("vec_tmp2", length=VLEN)
             vec_tmp3 = self.alloc_scratch("vec_tmp3", length=VLEN)
+            vec_addr = self.alloc_scratch("vec_addr", length=VLEN)
             vec_zero = self.scratch_vconst(0)
             vec_one = self.scratch_vconst(1)
             vec_two = self.scratch_vconst(2)
@@ -197,20 +198,23 @@ class KernelBuilder:
                         ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_const))
                     )
                     body.append(("load", ("vload", vec_val, tmp_addr)))
-                    # gather node values (scalar loads)
+                    # gather node values (scalar loads via per-lane address)
                     for lane in range(VLEN):
                         body.append(
                             (
                                 "alu",
                                 (
                                     "+",
-                                    tmp_addr,
+                                    vec_addr + lane,
                                     self.scratch["forest_values_p"],
                                     vec_idx + lane,
                                 ),
                             )
                         )
-                        body.append(("load", ("load", vec_node + lane, tmp_addr)))
+                    for lane in range(VLEN):
+                        body.append(
+                            ("load", ("load_offset", vec_node, vec_addr, lane))
+                        )
                     # val ^= node
                     body.append(("valu", ("^", vec_val, vec_val, vec_node)))
                     body.extend(self.build_hash_vec(vec_val, vec_tmp1, vec_tmp2, round, base))
