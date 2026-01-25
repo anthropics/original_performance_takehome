@@ -2,3 +2,4 @@ trace.json
 **/*.pyc
 .hypothesis
 .DS_Store
+logs/

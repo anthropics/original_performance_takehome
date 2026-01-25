@@ -1,3 +1,23 @@
+# Fork overview
+
+This fork focuses on pushing the cycle count down with a custom kernel builder and scheduler, plus
+tooling to speed up parameter search. The core algorithm is a SIMD-friendly, branchless tree
+traversal that preloads hot top-of-tree nodes, segments rounds, and staggers groups to overlap load
+latency with compute while a mini VLIW-style scheduler packs ops into per-engine slots.
+
+Utilities added or used heavily in this fork:
+- `scripts/efficient_optimize_runner.py`: staged coarse/refine/jitter/offset search runner.
+- `scripts/optimize_env.py`: grid + jitter + offset sweeps over env knobs.
+- `watch_trace.py` + `watch_trace.html`: trace viewer workflow for spotting bottlenecks.
+
+Current best - 1377 cycles:
+```code
+START_OFFSETS=2,8,14,23,33,36,42,51,58,64,70,79,100,92,98,107,106,120,126,135,1,12,22,35,52,56,66,88,90,100,110,123 \
+GROUPS_PER_BATCH=20 START_SPACING=7 START_SPACING_TAIL=11 PARITY_MASK=70 START_JITTER_PATTERN=2,1,0,2 python3 perf_takehome.py
+```
+
+Below is the original Anthropic performance take-home README.
+
 # Anthropic's Original Performance Take-Home
 
 This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.
