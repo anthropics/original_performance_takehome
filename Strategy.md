@@ -52,6 +52,23 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - Round 2 exact selector (idx 3..6): slower (rolled back).
 - Round 3 exact selector (idx 7..14): slower (rolled back).
 - Approximate 2-load round-2 split: incorrect (rolled back).
+- Depth-2/3 no-gather selector (SMALL_GATHER_D2/SMALL_GATHER_D3): regressed; selection cost outweighed load savings.
+- Depth-2 ALU selector (SMALL_GATHER_D2_ALU): regressed further.
+- Duplicate-idx broadcast gather idea: not viable without predicated loads/control (ISA/scheduler limitation).
+- Depth-3 flow-vselect selector: incorrect results (removed).
+- Depth-2 flow selector (SMALL_GATHER_D2_FLOW): small win; cycles ~1,899 (down from 1,969) but still above targets.
+- Depth-3 flow selector with range guard (SMALL_GATHER_D3_FLOW): correct but slow (~2,457 cycles); not worth using.
+
+## Hash simplification (attempts)
+- Scalarize XOR-stage op1 (SCALAR_XOR_OP1=1): regressed (~2,162 cycles); not useful.
+
+## Wrap skipping (extra)
+- MAX_DEPTH_ZERO=1: at max depth, skip parity/update and set idx=0 directly; small win (~1,873 cycles).
+- SKIP_LAST_IDX=1: skip idx update on final round; no win (slightly worse, ~1,797 cycles).
+
+## Index update simplification
+- IDX_MADD=1: compute idx update as `idx = idx*2 + (val&1)` via multiply_add; ~1,807 cycles.
+- IDX_DEPTH0_DIRECT=1: when depth==0, set idx directly to (val&1)+1; brings cycles down to ~1,777.
 
 ## Flow-to-VALU select (attempt)
 - Replace `vselect` with VALU mask logic (VSELECT_VALU=1): ~2,676 cycles (worse; VALU saturates).
@@ -115,13 +132,13 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - Gather loads + VALU remain near limits; flow largely removed. Further gains likely need fewer gathers or hash simplification.
 
 ## Current best settings
-- `VEC=1 VLIW=1 VEC_UNROLL=8 SMALL_GATHER=1 PER_VALUE_PIPE=1 PARITY_AND=1 ARITH_WRAP=1 SKIP_WRAP=1 SCALAR_OP2=1`
-- ~1,969 cycles (still above 1,300 target; below 2,164).
+- `VEC=1 VLIW=1 VEC_UNROLL=8 SMALL_GATHER=1 SMALL_GATHER_D2=1 SMALL_GATHER_D2_FLOW=1 PER_VALUE_PIPE=1 PARITY_AND=1 ARITH_WRAP=1 SKIP_WRAP=1 SCALAR_OP2=1 MAX_DEPTH_ZERO=1 IDX_MADD=1 IDX_DEPTH0_DIRECT=1`
+- ~1,777 cycles (passes the 1,790 threshold).
 
 ### Slot utilization and bundle counts
-Engine | Avg/Max | Bundles (out of 1,969)
-alu | 8.88 / 12 | 1,392
-valu | 4.06 / 6 | 1,896
-load | 1.92 / 2 | 1,662
-store | 1.00 / 2 | 64
-flow | 1.00 / 1 | 66
+Engine | Avg/Max | Bundles (out of 1,777)
+alu | 9.27 / 12 | 1,333
+valu | 4.21 / 6 | 1,707
+load | 1.85 / 2 | 1,453
+store | 1.07 / 2 | 60
+flow | 1.00 / 1 | 258
