@@ -208,6 +208,7 @@ class KernelBuilder:
         slots.append(("flow", ("vselect", dest, tmp_idx, tmp_pair, dest)))
         return slots
 
+
     def build_kernel(
         self,
         forest_height: int,
@@ -241,6 +242,7 @@ class KernelBuilder:
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        vlen_const = self.scratch_const(VLEN)
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -328,13 +330,25 @@ class KernelBuilder:
         vec_limit = (batch_size // VLEN) * VLEN
         # Per-value pipeline: load each vector chunk once, run all rounds, then store once.
         for base in range(0, vec_limit, VLEN * unroll):
-            # address setup + vload values
+            valid_uis = []
             for ui in range(unroll):
                 base_u = base + ui * VLEN
                 if base_u >= vec_limit:
-                    continue
-                base_u_const = self.scratch_const(base_u)
-                body.append(("alu", ("+", vec_addr_val_u[ui], self.scratch["inp_values_p"], base_u_const)))
+                    break
+                valid_uis.append(ui)
+            # address setup + vload values (pointer bump by VLEN)
+            base_const = self.scratch_const(base)
+            body.append(
+                (
+                    "alu",
+                    ("+", vec_addr_val_u[0], self.scratch["inp_values_p"], base_const),
+                )
+            )
+            for ui in valid_uis[1:]:
+                body.append(
+                    ("alu", ("+", vec_addr_val_u[ui], vec_addr_val_u[ui - 1], vlen_const))
+                )
+            for ui in valid_uis:
                 body.append(("load", ("vload", vec_val_u[ui], vec_addr_val_u[ui])))
                 body.append(
                     ("valu", ("vbroadcast", vec_addr_u[ui], self.scratch["forest_values_p"]))
@@ -343,19 +357,13 @@ class KernelBuilder:
                 depth = round % (forest_height + 1)
                 # gather node values
                 if depth not in (0, 1, 2):
-                    for ui in range(unroll):
-                        base_u = base + ui * VLEN
-                        if base_u >= vec_limit:
-                            continue
+                    for ui in valid_uis:
                         for lane in range(VLEN):
                             body.append(("load", ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane)))
                 # process each vector (hash interleaved across unroll)
                 val_groups = []
                 addr_vecs = []
-                for ui in range(unroll):
-                    base_u = base + ui * VLEN
-                    if base_u >= vec_limit:
-                        continue
+                for ui in valid_uis:
                     if depth == 0:
                         body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_forest0)))
                     elif depth == 1:
@@ -400,10 +408,7 @@ class KernelBuilder:
                 if round == rounds - 1:
                     continue
             # store values once per chunk
-            for ui in range(unroll):
-                base_u = base + ui * VLEN
-                if base_u >= vec_limit:
-                    continue
+            for ui in valid_uis:
                 body.append(("store", ("vstore", vec_addr_val_u[ui], vec_val_u[ui])))
         # tail (scalar)
         for i in range(vec_limit, batch_size):
@@ -459,6 +464,14 @@ def do_kernel_test(
         rounds,
     )
     # print(kb.instrs)
+    if os.getenv("ANALYZE_PATTERNS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }:
+        analyze_patterns(kb.instrs, kb.debug_info())
 
     value_trace = {}
     machine = Machine(
@@ -492,6 +505,380 @@ def do_kernel_test(
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
     return machine.cycle
+
+
+def analyze_patterns(instrs, debug_info=None):
+    # Skip init bundles until first vload, then analyze VALU/LOAD patterns.
+    start = 0
+    for i, instr in enumerate(instrs):
+        loads = instr.get("load", [])
+        if any(slot[0] == "vload" for slot in loads):
+            start = i
+            break
+
+    def _count_patterns(engine, size_filter=None):
+        counts = defaultdict(int)
+        for instr in instrs[start:]:
+            slots = instr.get(engine, [])
+            if not slots:
+                continue
+            if size_filter is not None and len(slots) not in size_filter:
+                continue
+            key = tuple(slot[0] for slot in slots)
+            counts[key] += 1
+        return counts
+
+    valu_2_3 = _count_patterns("valu", size_filter={2, 3})
+    load_all = _count_patterns("load", size_filter=None)
+
+    print("=== Pattern Analysis (starting at first vload) ===")
+    print(f"Start bundle index: {start}")
+    if valu_2_3:
+        print("VALU bundles with 2 or 3 slots (pattern -> count):")
+        for pattern, count in sorted(
+            valu_2_3.items(), key=lambda kv: (-kv[1], kv[0])
+        ):
+            print(f"  {pattern}: {count}")
+    else:
+        print("No VALU bundles with 2 or 3 slots found.")
+
+    if load_all:
+        print("LOAD bundle patterns (pattern -> count):")
+        for pattern, count in sorted(
+            load_all.items(), key=lambda kv: (-kv[1], kv[0])
+        ):
+            print(f"  {pattern}: {count}")
+    else:
+        print("No LOAD bundles found.")
+
+    # Cross-tab VALU slot counts vs other engines to see if other engines are busy.
+    valu_bundles = 0
+    valu_slot_hist = defaultdict(int)
+    cross = defaultdict(int)  # (valu_slots, alu_slots, load_slots, store_slots, flow_slots) -> count
+    for instr in instrs[start:]:
+        vslots = len(instr.get("valu", []))
+        if vslots == 0:
+            continue
+        aslots = len(instr.get("alu", []))
+        lslots = len(instr.get("load", []))
+        sslots = len(instr.get("store", []))
+        fslots = len(instr.get("flow", []))
+        valu_bundles += 1
+        valu_slot_hist[vslots] += 1
+        cross[(vslots, aslots, lslots, sslots, fslots)] += 1
+
+    print("VALU slot count histogram (slots -> bundles):")
+    for vslots, count in sorted(valu_slot_hist.items()):
+        print(f"  {vslots}: {count}")
+    if valu_bundles:
+        under = sum(valu_slot_hist[s] for s in (1, 2, 3))
+        print(
+            f"VALU underused (1-3 slots): {under}/{valu_bundles} "
+            f"({under * 100.0 / valu_bundles:.1f}%)"
+        )
+
+    print("Top VALU bundles by engine occupancy (v,a,l,s,f -> count):")
+    for key, count in sorted(cross.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
+        print(f"  {key}: {count}")
+
+    # Phase tagging for underused VALU bundles.
+    scratch_map = debug_info.scratch_map if debug_info is not None else {}
+
+    def _range_for(name):
+        for addr, (n, length) in scratch_map.items():
+            if n == name:
+                return (addr, addr + length)
+        return None
+
+    def _ranges_with_prefix(prefix):
+        res = []
+        for addr, (n, length) in scratch_map.items():
+            if n.startswith(prefix):
+                res.append((addr, addr + length))
+        return res
+
+    def _in_range(addr, rng):
+        return rng is not None and rng[0] <= addr < rng[1]
+
+    def _in_any(addr, ranges):
+        return any(_in_range(addr, r) for r in ranges)
+
+    val_range = _range_for("vec_val_pool")
+    addr_range = _range_for("vec_addr_pool")
+    tmp1_range = _range_for("vec_tmp1_pool")
+    tmp2_range = _range_for("vec_tmp2_pool")
+    node_range = _range_for("vec_node_pool")
+    tmp4_range = _range_for("vec_tmp4")
+    base1_range = _range_for("vec_base1_addr")
+    base3_range = _range_for("vec_base3_addr")
+    forest_ranges = _ranges_with_prefix("vec_forest")
+    forest0_range = _range_for("vec_forest0")
+    forest1_range = _range_for("vec_forest1")
+    forest2_range = _range_for("vec_forest2")
+    forest3_range = _range_for("vec_forest3")
+    forest4_range = _range_for("vec_forest4")
+    forest5_range = _range_for("vec_forest5")
+    forest6_range = _range_for("vec_forest6")
+    forest_values_p_range = _range_for("forest_values_p")
+
+    hash_ops = {"+", "^", "<<", ">>", "multiply_add"}
+
+    def _slot_addrs(engine, slot):
+        op = slot[0]
+        dest = None
+        srcs = []
+        if engine == "alu":
+            if op in ("~",):
+                dest = slot[1]
+                srcs = [slot[2]]
+            else:
+                dest = slot[1]
+                srcs = [slot[2], slot[3]]
+        elif engine == "valu":
+            if op == "vbroadcast":
+                dest = slot[1]
+                srcs = [slot[2]]
+            elif op == "multiply_add":
+                dest = slot[1]
+                srcs = [slot[2], slot[3], slot[4]]
+            else:
+                dest = slot[1]
+                srcs = [slot[2], slot[3]]
+        elif engine == "load":
+            if op in ("load", "load_offset", "vload", "const", "vbroadcast"):
+                dest = slot[1]
+            if op in ("load", "load_offset", "vload"):
+                srcs = [slot[2]]
+        elif engine == "flow":
+            if op in ("select", "vselect"):
+                dest = slot[1]
+                srcs = [slot[2], slot[3], slot[4]]
+            elif op == "add_imm":
+                dest = slot[1]
+                srcs = [slot[2]]
+        return op, dest, srcs
+
+    def _bundle_tags(instr):
+        tags = set()
+        # Gather bundles (load_offset into vec_node_pool).
+        for slot in instr.get("load", []):
+            if slot[0] == "load_offset" and _in_range(slot[1], node_range):
+                tags.add("gather")
+                break
+        # Small-gather: flow vselect or addr-based bit extraction.
+        if any(slot[0] == "vselect" for slot in instr.get("flow", [])):
+            tags.add("small_gather")
+
+        for engine, slots in instr.items():
+            for slot in slots:
+                op, dest, srcs = _slot_addrs(engine, slot)
+                if dest is None:
+                    continue
+                # Small-gather bit extraction from addr-based indices.
+                if op in ("-", "&", ">>") and _in_any(dest, [tmp1_range, tmp2_range, tmp4_range]):
+                    if any(
+                        _in_any(s, [addr_range, base1_range, base3_range]) for s in srcs
+                    ):
+                        tags.add("small_gather")
+                # Addr update (writes addr pool or parity extraction).
+                if _in_range(dest, addr_range):
+                    tags.add("addr_update")
+                if op == "&" and _in_range(dest, tmp1_range):
+                    if any(_in_range(s, val_range) for s in srcs):
+                        tags.add("addr_update")
+                # Hash stages (writes val/tmp pools with hash ops).
+                if op in hash_ops and (
+                    _in_range(dest, val_range)
+                    or _in_range(dest, tmp1_range)
+                    or _in_range(dest, tmp2_range)
+                ):
+                    tags.add("hash")
+                # Small-gather selection writes node pool using forest vectors.
+                if _in_range(dest, node_range) and _in_any(dest, [node_range]):
+                    if any(_in_any(s, forest_ranges) for s in srcs):
+                        tags.add("small_gather")
+
+        if not tags:
+            tags.add("other")
+        return tags
+
+    def _bundle_depth_tags(instr):
+        depth_tags = set()
+        for engine, slots in instr.items():
+            for slot in slots:
+                op, dest, srcs = _slot_addrs(engine, slot)
+                if op is None:
+                    continue
+                # Depth 0: XOR with vec_forest0.
+                if op == "^" and dest is not None and _in_range(dest, val_range):
+                    if any(_in_any(s, [forest0_range]) for s in srcs):
+                        depth_tags.add("d0")
+                if dest is not None and _in_any(dest, [forest0_range]):
+                    depth_tags.add("d0")
+                # Depth 1: vselect between forest1/2 or base1 addr math.
+                if any(
+                    _in_any(s, [forest1_range, forest2_range, base1_range]) for s in srcs
+                ):
+                    depth_tags.add("d1")
+                if dest is not None and _in_any(dest, [forest1_range, forest2_range]):
+                    depth_tags.add("d1")
+                # Depth 2: vselect using forest3..6 or base3 addr math.
+                if any(
+                    _in_any(
+                        s,
+                        [
+                            forest3_range,
+                            forest4_range,
+                            forest5_range,
+                            forest6_range,
+                            base3_range,
+                        ],
+                    )
+                    for s in srcs
+                ):
+                    depth_tags.add("d2")
+                if dest is not None and _in_any(
+                    dest, [forest3_range, forest4_range, forest5_range, forest6_range]
+                ):
+                    depth_tags.add("d2")
+                # Depth >=3: gather via load_offset into node pool.
+                if (
+                    engine == "load"
+                    and op == "load_offset"
+                    and dest is not None
+                    and _in_range(dest, node_range)
+                ):
+                    depth_tags.add("d>=3")
+                # Depth max: addr reset via vbroadcast from forest_values_p.
+                if (
+                    engine == "valu"
+                    and op == "vbroadcast"
+                    and dest is not None
+                    and _in_range(dest, addr_range)
+                ):
+                    if srcs and _in_range(srcs[0], forest_values_p_range):
+                        depth_tags.add("dmax")
+        if not depth_tags:
+            depth_tags.add("d?")
+        return depth_tags
+
+    under_by_tag = defaultdict(int)
+    under_by_combo = defaultdict(int)
+    under_total = 0
+    under_by_depth = defaultdict(int)
+    underused_bundles = []
+    bundle_infos = []
+    last_depth = None
+    round_guess = 0
+    seen_depth = False
+    for instr in instrs[start:]:
+        vslots = len(instr.get("valu", []))
+        depth_tags = _bundle_depth_tags(instr)
+        depth_primary = None
+        if len(depth_tags) == 1:
+            depth_primary = next(iter(depth_tags))
+        if depth_primary is not None:
+            if not seen_depth:
+                round_guess = 0
+                seen_depth = True
+            if depth_primary == "d0" and last_depth not in (None, "d0"):
+                round_guess += 1
+            last_depth = depth_primary
+        bundle_infos.append(
+            {
+                "instr": instr,
+                "depth_tags": depth_tags,
+                "depth_primary": depth_primary,
+                "round": round_guess if seen_depth else None,
+            }
+        )
+        if vslots not in (1, 2, 3):
+            continue
+        under_total += 1
+        tags = _bundle_tags(instr)
+        for tag in tags:
+            under_by_tag[tag] += 1
+        combo = tuple(sorted(tags))
+        under_by_combo[combo] += 1
+        underused_bundles.append((combo, instr))
+        if depth_primary is None:
+            under_by_depth["mixed"] += 1
+        for dtag in depth_tags:
+            under_by_depth[dtag] += 1
+
+    print("Underused VALU bundles by phase tag (1-3 slots):")
+    for tag, count in sorted(under_by_tag.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {tag}: {count}")
+    print("Underused VALU bundle tag combinations (top 15):")
+    for combo, count in sorted(under_by_combo.items(), key=lambda kv: (-kv[1], kv[0]))[:15]:
+        print(f"  {combo}: {count}")
+
+    print("Underused VALU bundles by depth tag (1-3 slots):")
+    for tag, count in sorted(under_by_depth.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {tag}: {count}")
+
+    # Show a few concrete bundles for the most common tag combinations.
+    def _format_operand(val):
+        if not isinstance(val, int):
+            return val
+        for addr, (name, length) in scratch_map.items():
+            if addr <= val < addr + length:
+                offset = val - addr
+                if length == 1 or offset == 0:
+                    return name
+                return f"{name}+{offset}"
+        return val
+
+    def _format_slot(slot):
+        op = slot[0]
+        return tuple([op] + [_format_operand(v) for v in slot[1:]])
+
+    max_examples = int(os.getenv("ANALYZE_PATTERNS_EXAMPLES", "5") or 5)
+    print(f"Sample underused bundles by tag combo (up to {max_examples} each):")
+    for combo, count in sorted(under_by_combo.items(), key=lambda kv: (-kv[1], kv[0]))[:10]:
+        print(f"  {combo}: {count}")
+        shown = 0
+        for bcombo, instr in underused_bundles:
+            if bcombo != combo:
+                continue
+            print("    bundle:")
+            for engine in ("load", "alu", "valu", "flow", "store"):
+                slots = instr.get(engine, [])
+                if not slots:
+                    continue
+                formatted = [_format_slot(s) for s in slots]
+                print(f"      {engine}: {formatted}")
+            shown += 1
+            if shown >= max_examples:
+                break
+
+    out_path = os.getenv("ANALYZE_PATTERNS_OUT", "pattern_bundles.txt").strip()
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("Bundle analysis (post-schedule)\n")
+            f.write(f"start_bundle_index={start}\n")
+            for idx, info in enumerate(bundle_infos):
+                instr = info["instr"]
+                vslots = len(instr.get("valu", []))
+                aslots = len(instr.get("alu", []))
+                lslots = len(instr.get("load", []))
+                sslots = len(instr.get("store", []))
+                fslots = len(instr.get("flow", []))
+                under = 1 <= vslots <= 3
+                depth_tags = ",".join(sorted(info["depth_tags"]))
+                f.write(
+                    f"[{idx}] round={info['round']} depth={info['depth_primary']} "
+                    f"depth_tags={depth_tags} underused={under} "
+                    f"occ=(v{vslots},a{aslots},l{lslots},s{sslots},f{fslots})\n"
+                )
+                for engine in ("load", "alu", "valu", "flow", "store"):
+                    slots = instr.get(engine, [])
+                    if not slots:
+                        continue
+                    formatted = [_format_slot(s) for s in slots]
+                    f.write(f"  {engine}: {formatted}\n")
+            f.write("end\n")
+        print(f"Wrote full bundle dump to {out_path}")
 
 
 def _parse_args():
