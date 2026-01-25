@@ -82,6 +82,55 @@ class KernelBuilder:
                 drop_valu = len(valu_idxs)
             drop_set = set(rng.sample(valu_idxs, drop_valu))
             slots = [slot for i, slot in enumerate(slots) if i not in drop_set]
+        sched_weighted = os.getenv("SCHED_WEIGHTED", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_slack = os.getenv("SCHED_SLACK", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_global = os.getenv("SCHED_GLOBAL", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_repair = os.getenv("SCHED_REPAIR", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_mem = os.getenv("SCHED_MEM_DISAMBIG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_rename = os.getenv("SCHED_RENAME", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_stats = os.getenv("SCHED_STATS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         # Check for explicit env overrides, otherwise use optimized defaults
         def _env_bool(name, default=False):
             val = os.getenv(name, "").strip().lower()
@@ -107,6 +156,8 @@ class KernelBuilder:
             global_pick=sched_global,
             bundle_repair=sched_repair,
             disambiguate_mem=sched_mem,
+            rename_war_waw=sched_rename,
+            debug_stats=sched_stats,
             beam_search=sched_beam,
             beam_width=beam_width,
         )

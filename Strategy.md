@@ -22,6 +22,10 @@ approximate cycle impact. All cycle numbers refer to the default workload
   - `SCHED_MEM_DISAMBIG=1` improved to ~1,545 cycles (passes 1,548 threshold).
 - Mem disambiguation + repair (scheduler flags only):
   - `SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1` improved to ~1,534 cycles.
+- Mem disambiguation + repair + global pick (scheduler flags only):
+  - `SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1 SCHED_GLOBAL=1` no change (~1,534 cycles).
+- WAR/WAW renamer (scheduler flag only, scalar regs; excludes mem addr regs):
+  - `SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1 SCHED_RENAME=1` no change (~1,534 cycles).
 
 ## Vectorization
 - VEC (vector ops + scalar gather): large win vs baseline.
