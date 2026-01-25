@@ -131,6 +131,23 @@ class KernelBuilder:
             "y",
             "on",
         }
+        # Check for explicit env overrides, otherwise use optimized defaults
+        def _env_bool(name, default=False):
+            val = os.getenv(name, "").strip().lower()
+            if val in {"1", "true", "yes", "y", "on"}:
+                return True
+            if val in {"0", "false", "no", "n", "off"}:
+                return False
+            return default
+
+        # Best settings: MEM_DISAMBIG + REPAIR give 1534 cycles
+        sched_weighted = _env_bool("SCHED_WEIGHTED", default=False)
+        sched_slack = _env_bool("SCHED_SLACK", default=False)
+        sched_global = _env_bool("SCHED_GLOBAL", default=False)
+        sched_repair = _env_bool("SCHED_REPAIR", default=True)  # Default ON
+        sched_mem = _env_bool("SCHED_MEM_DISAMBIG", default=True)  # Default ON
+        sched_beam = _env_bool("SCHED_BEAM", default=False)
+        beam_width = int(os.getenv("BEAM_WIDTH", "16") or 16)
         return schedule_slots(
             slots,
             SLOT_LIMITS,
@@ -141,6 +158,8 @@ class KernelBuilder:
             disambiguate_mem=sched_mem,
             rename_war_waw=sched_rename,
             debug_stats=sched_stats,
+            beam_search=sched_beam,
+            beam_width=beam_width,
         )
 
     def add(self, engine, slot):
@@ -267,6 +286,42 @@ class KernelBuilder:
         slots.append(("flow", ("vselect", dest, tmp_idx, tmp_pair, dest)))
         return slots
 
+    def build_small_gather_select8_flow(
+        self,
+        dest,
+        idx_vec,
+        base_vec,
+        vals8,
+        tmp_idx,
+        tmp_bit0,
+        tmp_bit1,
+        tmp_pair,
+        vec_one,
+    ):
+        # 8-way select using 7 flow vselects; tmp_idx reused for bit2.
+        slots = []
+        slots.append(("valu", ("-", tmp_idx, idx_vec, base_vec)))
+        # bit0
+        slots.append(("valu", ("&", tmp_bit0, tmp_idx, vec_one)))
+        # bit1
+        slots.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+        slots.append(("valu", ("&", tmp_bit1, tmp_idx, vec_one)))
+        # bit2
+        slots.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+        slots.append(("valu", ("&", tmp_idx, tmp_idx, vec_one)))
+        # level 0 (bit0)
+        slots.append(("flow", ("vselect", dest, tmp_bit0, vals8[1], vals8[0])))
+        slots.append(("flow", ("vselect", tmp_pair, tmp_bit0, vals8[3], vals8[2])))
+        # level 1 (bit1) for lower half
+        slots.append(("flow", ("vselect", dest, tmp_bit1, tmp_pair, dest)))
+        # upper half
+        slots.append(("flow", ("vselect", tmp_pair, tmp_bit0, vals8[5], vals8[4])))
+        slots.append(("flow", ("vselect", tmp_bit0, tmp_bit0, vals8[7], vals8[6])))
+        slots.append(("flow", ("vselect", tmp_pair, tmp_bit1, tmp_bit0, tmp_pair)))
+        # level 2 (bit2)
+        slots.append(("flow", ("vselect", dest, tmp_idx, tmp_pair, dest)))
+        return slots
+
 
     def build_kernel(
         self,
@@ -321,8 +376,26 @@ class KernelBuilder:
 
         # Best-settings vector path.
         unroll = 20
-        vec_tmp3 = self.alloc_scratch("vec_tmp3", length=VLEN)
+        def _env_bool(name, default=False):
+            val = os.getenv(name, "").strip().lower()
+            if val in {"1", "true", "yes", "y", "on"}:
+                return True
+            if val in {"0", "false", "no", "n", "off"}:
+                return False
+            return default
+
+        enable_d3_select = _env_bool("SMALL_GATHER_D3", default=True)
         vec_tmp4 = self.alloc_scratch("vec_tmp4", length=VLEN)
+        vec_tmp3_base = (
+            self.alloc_scratch("vec_tmp3_pool", length=unroll * VLEN)
+            if enable_d3_select
+            else None
+        )
+        vec_bit1_base = (
+            self.alloc_scratch("vec_bit1_pool", length=unroll * VLEN)
+            if enable_d3_select
+            else None
+        )
 
         # Allocate vector pools to avoid scratch overlap between different roles.
         # vec_addr_pool holds per-lane node addresses (forest base + idx).
@@ -339,6 +412,16 @@ class KernelBuilder:
         vec_node_u = [vec_node_base + ui * VLEN for ui in range(unroll)]
         vec_tmp1_u = [vec_tmp1_base + ui * VLEN for ui in range(unroll)]
         vec_tmp2_u = [vec_tmp2_base + ui * VLEN for ui in range(unroll)]
+        vec_tmp3_u = (
+            [vec_tmp3_base + ui * VLEN for ui in range(unroll)]
+            if enable_d3_select
+            else None
+        )
+        vec_bit1_u = (
+            [vec_bit1_base + ui * VLEN for ui in range(unroll)]
+            if enable_d3_select
+            else None
+        )
         vec_addr_val_u = [vec_addr_val_base + ui for ui in range(unroll)]
         vec_one = self.scratch_vconst(1)
         vec_two = self.scratch_vconst(2)
@@ -355,6 +438,11 @@ class KernelBuilder:
         vec_forest2 = self.alloc_scratch("vec_forest2", length=VLEN)
         vec_base1_addr = self.alloc_scratch("vec_base1_addr", length=VLEN)
         vec_base3_addr = self.alloc_scratch("vec_base3_addr", length=VLEN)
+        vec_base7_addr = (
+            self.alloc_scratch("vec_base7_addr", length=VLEN)
+            if enable_d3_select
+            else None
+        )
         body.append(("alu", ("-", addr_bias, one_const, self.scratch["forest_values_p"])))
         body.append(("alu", ("+", base_plus1, self.scratch["forest_values_p"], one_const)))
         body.append(("valu", ("vbroadcast", vec_addr_bias, addr_bias)))
@@ -370,10 +458,15 @@ class KernelBuilder:
         vec_base3 = self.scratch_vconst(3)
         body.append(("valu", ("+", vec_base1_addr, vec_forest_base, vec_one)))
         body.append(("valu", ("+", vec_base3_addr, vec_forest_base, vec_base3)))
+        if enable_d3_select:
+            vec_base7 = self.scratch_vconst(7)
+            body.append(("valu", ("+", vec_base7_addr, vec_forest_base, vec_base7)))
         forest3_6 = []
         forest3_6_consts = []
         vec_forest3_6 = []
-        for idx in range(3, 7):
+        forest7_14 = []
+        vec_forest7_14 = []
+        for idx in range(3, 15 if enable_d3_select else 7):
             f = self.alloc_scratch(f"forest{idx}")
             vf = self.alloc_scratch(f"vec_forest{idx}", length=VLEN)
             idx_const = self.scratch_const(idx)
@@ -382,9 +475,13 @@ class KernelBuilder:
             )
             body.append(("load", ("load", f, tmp_addr)))
             body.append(("valu", ("vbroadcast", vf, f)))
-            forest3_6.append(f)
-            forest3_6_consts.append(idx_const)
-            vec_forest3_6.append(vf)
+            if idx <= 6:
+                forest3_6.append(f)
+                forest3_6_consts.append(idx_const)
+                vec_forest3_6.append(vf)
+            elif enable_d3_select:
+                forest7_14.append(f)
+                vec_forest7_14.append(vf)
 
         vec_limit = (batch_size // VLEN) * VLEN
         # Per-value pipeline: load each vector chunk once, run all rounds, then store once.
@@ -414,8 +511,9 @@ class KernelBuilder:
                 )
             for round in range(rounds):
                 depth = round % (forest_height + 1)
+                use_d3_select = enable_d3_select and depth == 3
                 # gather node values
-                if depth not in (0, 1, 2):
+                if depth not in (0, 1, 2) and not use_d3_select:
                     for ui in valid_uis:
                         for lane in range(VLEN):
                             body.append(("load", ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane)))
@@ -443,6 +541,24 @@ class KernelBuilder:
                             )
                         )
                         body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
+                    elif depth == 3:
+                        if use_d3_select:
+                            body.extend(
+                                self.build_small_gather_select8_flow(
+                                    vec_node_u[ui],
+                                    vec_addr_u[ui],
+                                    vec_base7_addr,
+                                    vec_forest7_14,
+                                    vec_tmp1_u[ui],
+                                    vec_tmp2_u[ui],
+                                    vec_bit1_u[ui],
+                                    vec_tmp3_u[ui],
+                                    vec_one,
+                                )
+                            )
+                            body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
+                        else:
+                            body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
                     else:
                         body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
                     val_groups.append((vec_val_u[ui], vec_tmp1_u[ui], vec_tmp2_u[ui]))
@@ -666,10 +782,13 @@ def analyze_patterns(instrs, debug_info=None):
     addr_range = _range_for("vec_addr_pool")
     tmp1_range = _range_for("vec_tmp1_pool")
     tmp2_range = _range_for("vec_tmp2_pool")
+    tmp3_range = _range_for("vec_tmp3_pool")
+    bit1_range = _range_for("vec_bit1_pool")
     node_range = _range_for("vec_node_pool")
     tmp4_range = _range_for("vec_tmp4")
     base1_range = _range_for("vec_base1_addr")
     base3_range = _range_for("vec_base3_addr")
+    base7_range = _range_for("vec_base7_addr")
     forest_ranges = _ranges_with_prefix("vec_forest")
     forest0_range = _range_for("vec_forest0")
     forest1_range = _range_for("vec_forest1")
@@ -678,6 +797,14 @@ def analyze_patterns(instrs, debug_info=None):
     forest4_range = _range_for("vec_forest4")
     forest5_range = _range_for("vec_forest5")
     forest6_range = _range_for("vec_forest6")
+    forest7_range = _range_for("vec_forest7")
+    forest8_range = _range_for("vec_forest8")
+    forest9_range = _range_for("vec_forest9")
+    forest10_range = _range_for("vec_forest10")
+    forest11_range = _range_for("vec_forest11")
+    forest12_range = _range_for("vec_forest12")
+    forest13_range = _range_for("vec_forest13")
+    forest14_range = _range_for("vec_forest14")
     forest_values_p_range = _range_for("forest_values_p")
 
     hash_ops = {"+", "^", "<<", ">>", "multiply_add"}
@@ -734,9 +861,13 @@ def analyze_patterns(instrs, debug_info=None):
                 if dest is None:
                     continue
                 # Small-gather bit extraction from addr-based indices.
-                if op in ("-", "&", ">>") and _in_any(dest, [tmp1_range, tmp2_range, tmp4_range]):
+                if op in ("-", "&", ">>") and _in_any(
+                    dest,
+                    [tmp1_range, tmp2_range, tmp3_range, tmp4_range, bit1_range],
+                ):
                     if any(
-                        _in_any(s, [addr_range, base1_range, base3_range]) for s in srcs
+                        _in_any(s, [addr_range, base1_range, base3_range, base7_range])
+                        for s in srcs
                     ):
                         tags.add("small_gather")
                 # Addr update (writes addr pool or parity extraction).
@@ -800,6 +931,39 @@ def analyze_patterns(instrs, debug_info=None):
                     dest, [forest3_range, forest4_range, forest5_range, forest6_range]
                 ):
                     depth_tags.add("d2")
+                # Depth 3: vselect using forest7..14 or base7 addr math.
+                if any(
+                    _in_any(
+                        s,
+                        [
+                            forest7_range,
+                            forest8_range,
+                            forest9_range,
+                            forest10_range,
+                            forest11_range,
+                            forest12_range,
+                            forest13_range,
+                            forest14_range,
+                            base7_range,
+                        ],
+                    )
+                    for s in srcs
+                ):
+                    depth_tags.add("d3")
+                if dest is not None and _in_any(
+                    dest,
+                    [
+                        forest7_range,
+                        forest8_range,
+                        forest9_range,
+                        forest10_range,
+                        forest11_range,
+                        forest12_range,
+                        forest13_range,
+                        forest14_range,
+                    ],
+                ):
+                    depth_tags.add("d3")
                 # Depth >=3: gather via load_offset into node pool.
                 if (
                     engine == "load"

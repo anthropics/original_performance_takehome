@@ -214,6 +214,8 @@ def schedule_slots(
     rename_war_waw: bool = False,
     rename_vectors: bool = False,
     debug_stats: bool = False,
+    beam_search: bool = False,
+    beam_width: int = 16,
 ) -> List[Dict[str, List[Tuple]]]:
     """
     Schedule a sequence of slots into VLIW bundles.
@@ -229,6 +231,7 @@ def schedule_slots(
     rename_war_waw enables a conservative scratch renamer to reduce WAR/WAW edges.
     rename_vectors enables vector register renaming for full-vector temps.
     debug_stats prints dependency graph and renamer statistics.
+    beam_search uses beam search to explore multiple bundle configurations.
     Returns a list of instruction bundles (dict of engine -> list of slots).
     """
     if rename_war_waw:
@@ -1126,6 +1129,143 @@ def schedule_slots(
             return (-priority[idx], slack[idx], idx)
         return (-priority[idx], idx)
 
+    def compute_unlock_scores(ready_list: List[int]) -> Dict[int, int]:
+        """Compute unlock bonus for each ready op (sum of priorities of successors with indeg=1)."""
+        scores = {}
+        for idx in ready_list:
+            score = 0
+            for s in succ.get(idx, []):
+                if indeg[s] == 1:
+                    score += priority[s]
+            scores[idx] = score
+        return scores
+
+    def beam_search_bundle(
+        ready_list: List[int],
+        unlock_scores: Dict[int, int],
+        width: int,
+    ) -> set:
+        """
+        Use beam search to find a good bundle configuration.
+
+        Two-phase approach:
+        1. Greedily fill scarce slots (load, store, flow) first
+        2. Use beam search for remaining slots (alu, valu)
+
+        Returns set of picked indices.
+        """
+        picked_set: set = set()
+        used: Dict[str, int] = defaultdict(int)
+
+        # Precompute engine for each op
+        op_engines = {idx: slots[idx][0] for idx in ready_list}
+
+        # Phase 1: Greedily fill scarce engines (load, store, flow)
+        # These have few slots so greedy is optimal
+        scarce_engines = ["load", "store", "flow"]
+        for engine in scarce_engines:
+            limit = slot_limits.get(engine, 0)
+            candidates = [
+                idx for idx in ready_list
+                if op_engines[idx] == engine and idx not in picked_set
+            ]
+            # Sort by priority + unlock score
+            candidates.sort(key=lambda idx: -(priority[idx] + unlock_scores.get(idx, 0)))
+            for idx in candidates:
+                if used[engine] >= limit:
+                    break
+                picked_set.add(idx)
+                used[engine] += 1
+
+        # Phase 2: Beam search for remaining engines (alu, valu)
+        remaining_engines = {"alu", "valu", "debug"}
+        remaining_ready = [
+            idx for idx in ready_list
+            if op_engines[idx] in remaining_engines and idx not in picked_set
+        ]
+
+        if not remaining_ready:
+            return picked_set
+
+        # Score purely by unlock potential - maximize ops unlocked for next bundle
+        # This directly reduces total bundle count
+        op_scores = {}
+        for idx in remaining_ready:
+            # Weight unlock bonus more heavily than priority
+            op_scores[idx] = 3 * unlock_scores.get(idx, 0) + priority[idx]
+
+        # State -> score mapping
+        base_frozen = frozenset(picked_set)
+        base_score = sum(op_scores.get(idx, 0) for idx in picked_set)
+        states: Dict[frozenset, int] = {base_frozen: base_score}
+        terminal: Dict[frozenset, int] = {}
+
+        max_iters = slot_limits.get("alu", 0) + slot_limits.get("valu", 0)
+
+        for _ in range(max_iters):
+            if not states:
+                break
+
+            next_states: Dict[frozenset, int] = {}
+
+            for picked_frozen, score in states.items():
+                picked = set(picked_frozen)
+
+                # Compute used counts for remaining engines
+                used_now: Dict[str, int] = defaultdict(int)
+                for idx in picked:
+                    eng = op_engines.get(idx, slots[idx][0])
+                    used_now[eng] += 1
+
+                any_added = False
+                for idx in remaining_ready:
+                    if idx in picked:
+                        continue
+                    engine = op_engines[idx]
+                    limit = slot_limits.get(engine, 0)
+                    if used_now[engine] >= limit:
+                        continue
+
+                    # Can add this op
+                    any_added = True
+                    new_picked = picked | {idx}
+                    new_frozen = frozenset(new_picked)
+                    new_score = score + op_scores[idx]
+
+                    # Keep best score for this configuration
+                    if new_frozen not in next_states or next_states[new_frozen] < new_score:
+                        next_states[new_frozen] = new_score
+
+                if not any_added:
+                    # Terminal state (bundle is full)
+                    if picked_frozen not in terminal or terminal[picked_frozen] < score:
+                        terminal[picked_frozen] = score
+
+            if not next_states:
+                break
+
+            # Prune to top B by score, then size
+            sorted_states = sorted(
+                next_states.items(),
+                key=lambda x: (-x[1], -len(x[0]))
+            )
+            states = dict(sorted_states[:width])
+
+        # Add any remaining non-terminal states as terminal
+        for picked_frozen, score in states.items():
+            if picked_frozen not in terminal or terminal[picked_frozen] < score:
+                terminal[picked_frozen] = score
+
+        if not terminal:
+            return picked_set
+
+        # Return best terminal bundle (prefer more ops, then higher score)
+        best_frozen = max(
+            terminal.keys(),
+            key=lambda fs: (len(fs), terminal[fs])
+        )
+        return set(best_frozen)
+
     while scheduled < n:
         bundle: Dict[str, List[Tuple]] = {}
         used = defaultdict(int)
@@ -1144,7 +1284,17 @@ def schedule_slots(
             picked.append(idx)
             picked_set.add(idx)
 
-        if global_pick:
+        if beam_search:
+            # Use beam search to find bundle configuration
+            unlock_scores = compute_unlock_scores(ready_list)
+            picked_set = beam_search_bundle(ready_list, unlock_scores, beam_width)
+            if picked_set:
+                picked = sorted(picked_set)
+                for idx in picked:
+                    engine, slot = slots[idx]
+                    bundle.setdefault(engine, []).append(slot)
+                    used[engine] += 1
+        elif global_pick:
             candidates = [idx for idx in ready_list if idx not in picked_set]
             candidates.sort(key=ready_sort_key)
             for idx in candidates:
