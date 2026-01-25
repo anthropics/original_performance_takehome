@@ -13,6 +13,15 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - Critical-path priority scheduling + opportunistic fill (deterministic):
   - ~1,576 cycles (from ~1,637) on current kernel.
   - Added optional flags: `disambiguate_mem` (affine mem keys) and `load_offset_reads_base` (ISA semantics); both left off by default.
+- Weighted critical-path + slack tie-break (scheduler flags only):
+  - `SCHED_WEIGHTED=1` regressed to ~1,647 cycles.
+  - `SCHED_SLACK=1` no measurable change (~1,576 cycles).
+- One-bundle lookahead repair (scheduler flag only):
+  - `SCHED_REPAIR=1` improved to ~1,568 cycles.
+- Expanded mem disambiguation (scheduler flag only):
+  - `SCHED_MEM_DISAMBIG=1` improved to ~1,545 cycles (passes 1,548 threshold).
+- Mem disambiguation + repair (scheduler flags only):
+  - `SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1` improved to ~1,534 cycles.
 
 ## Vectorization
 - VEC (vector ops + scalar gather): large win vs baseline.
@@ -154,12 +163,12 @@ approximate cycle impact. All cycle numbers refer to the default workload
 
 ## Current best settings
 - Best path is now hardcoded (flags removed): VEC+VLIW, unroll=20, per‑value pipeline, depth‑0/1/2 small‑gather, parity via AND, idx update via multiply_add, depth‑0 direct idx, max‑depth idx=0.
-- ~1,576 cycles (below 1,579 target, still above 1,548 next threshold in `tests/submission_tests.py`).
+- ~1,534 cycles with scheduler flags (`SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1`).
 
 ### Slot utilization and bundle counts
-Engine | Avg/Max | Bundles (profile @ ~1,576 cycles)
-alu | 9.90 / 12 | 1,245
-valu | 4.70 / 6 | 1,468
-load | 1.94 / 2 | 1,356
-store | 1.23 / 2 | 26
+Engine | Avg/Max | Bundles (profile @ ~1,534 cycles)
+alu | 9.87 / 12 | 1,249
+valu | 4.67 / 6 | 1,478
+load | 1.95 / 2 | 1,349
+store | 1.07 / 2 | 30
 flow | 1.00 / 1 | 258
