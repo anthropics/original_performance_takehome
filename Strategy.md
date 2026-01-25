@@ -22,6 +22,8 @@ approximate cycle impact. All cycle numbers refer to the default workload
   - `SCHED_MEM_DISAMBIG=1` improved to ~1,545 cycles (passes 1,548 threshold).
 - Mem disambiguation + repair (scheduler flags only):
   - `SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1` improved to ~1,534 cycles.
+- Defaults now enable `SCHED_MEM_DISAMBIG=1` and `SCHED_REPAIR=1`.
+- Scheduler window (SCHED_WINDOW=0/1024): no measurable change (still ~1,493).
 - Mem disambiguation + repair + global pick (scheduler flags only):
   - `SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1 SCHED_GLOBAL=1` no change (~1,534 cycles).
 - WAR/WAW renamer (scheduler flag only, scalar regs; excludes mem addr regs):
@@ -42,11 +44,13 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - Interleave hash stages across unrolled vectors:
   - VEC_UNROLL=2: ~7,246 cycles (small win vs 7,258).
   - VEC_UNROLL=8: ~2,683 cycles (with interleaving).
+- Hash grouping (HASH_GROUP=2/4/8): no measurable change vs default (~1,493).
 
 ## Small-domain gather (exact)
 - Round 0 (idx always 0): remove gather entirely (use forest[0] broadcast).
 - Round 1 (idx in {1,2}): vselect between forest[1]/forest[2].
-- Depth 3 (idx in 7..14): preload forest[7..14], 8-way flow vselect; ~1,503 cycles (from ~1,534).
+- Depth 3 (idx in 7..14): preload forest[7..14], 8-way flow vselect; ~1,503 cycles (from ~1,534), ~1,493 after grouping refactor.
+- Depth 4 (idx in 15..30): preload forest[15..30], 16-way flow vselect (requires unroll reduction); regressed (~1,878 cycles with unroll=14).
 - With VEC_UNROLL=8 + SMALL_GATHER round 0/1: ~2,536 cycles (best so far).
 
 ## Per-value pipeline (rounds inside vector chunk)
@@ -80,6 +84,7 @@ approximate cycle impact. All cycle numbers refer to the default workload
 
 ## Hash simplification (attempts)
 - Scalarize XOR-stage op1 (SCALAR_XOR_OP1=1): regressed (~2,162 cycles); not useful.
+- Early-parity address update (compute hash LSB ahead of full hash): incorrect (hash LSB not affine due to carries from add/shift mix).
 
 ## Wrap skipping (extra)
 - MAX_DEPTH_ZERO=1: at max depth, skip parity/update and set idx=0 directly; small win (~1,873 cycles).
@@ -168,12 +173,12 @@ approximate cycle impact. All cycle numbers refer to the default workload
 
 ## Current best settings
 - Best path is now hardcoded (flags removed): VEC+VLIW, unroll=20, per‑value pipeline, depth‑0/1/2/3 small‑gather, parity via AND, idx update via multiply_add, depth‑0 direct idx, max‑depth idx=0.
-- ~1,503 cycles with scheduler flags (`SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1`).
+- ~1,493 cycles with scheduler flags (`SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1`).
 
 ### Slot utilization and bundle counts
-Engine | Avg/Max | Bundles (profile @ ~1,534 cycles)
-alu | 9.87 / 12 | 1,249
-valu | 4.67 / 6 | 1,478
-load | 1.95 / 2 | 1,349
-store | 1.07 / 2 | 30
-flow | 1.00 / 1 | 258
+Engine | Avg/Max | Bundles (profile @ ~1,493 cycles)
+alu | 9.89 / 12 | 1,247
+valu | 5.02 / 6 | 1,435
+load | 1.82 / 2 | 1,173
+store | 1.03 / 2 | 31
+flow | 1.00 / 1 | 706

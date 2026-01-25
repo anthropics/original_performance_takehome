@@ -148,9 +148,11 @@ class KernelBuilder:
         sched_mem = _env_bool("SCHED_MEM_DISAMBIG", default=True)  # Default ON
         sched_beam = _env_bool("SCHED_BEAM", default=False)
         beam_width = int(os.getenv("BEAM_WIDTH", "16") or 16)
+        sched_window = int(os.getenv("SCHED_WINDOW", "256") or 256)
         return schedule_slots(
             slots,
             SLOT_LIMITS,
+            window=sched_window,
             weighted_priority=sched_weighted,
             slack_tie_break=sched_slack,
             global_pick=sched_global,
@@ -322,6 +324,21 @@ class KernelBuilder:
         slots.append(("flow", ("vselect", dest, tmp_idx, tmp_pair, dest)))
         return slots
 
+    def build_select4_flow_bits(
+        self,
+        dest,
+        bit0,
+        bit1,
+        vals4,
+        tmp_pair,
+    ):
+        # 4-way select using precomputed bit0/bit1; tmp_pair is scratch.
+        slots = []
+        slots.append(("flow", ("vselect", dest, bit0, vals4[1], vals4[0])))
+        slots.append(("flow", ("vselect", tmp_pair, bit0, vals4[3], vals4[2])))
+        slots.append(("flow", ("vselect", dest, bit1, tmp_pair, dest)))
+        return slots
+
 
     def build_kernel(
         self,
@@ -384,16 +401,40 @@ class KernelBuilder:
                 return False
             return default
 
+        d3_env = os.getenv("SMALL_GATHER_D3")
         enable_d3_select = _env_bool("SMALL_GATHER_D3", default=True)
+        enable_d4_select = _env_bool("SMALL_GATHER_D4", default=False)
+        if enable_d4_select and d3_env is None:
+            # Prefer depth-4 selector when enabled to stay within scratch limits.
+            enable_d3_select = False
+        enable_early_parity = _env_bool("EARLY_PARITY", default=False)
+        if enable_d4_select:
+            # Depth-4 preload needs more scratch; reduce unroll to fit.
+            unroll = 14
+        elif enable_early_parity:
+            # Early-parity buffer needs more scratch; reduce unroll to fit.
+            unroll = 16
         vec_tmp4 = self.alloc_scratch("vec_tmp4", length=VLEN)
+        need_tmp3_pool = enable_d3_select or enable_d4_select
+        need_bit1_pool = enable_d3_select or enable_d4_select
         vec_tmp3_base = (
             self.alloc_scratch("vec_tmp3_pool", length=unroll * VLEN)
-            if enable_d3_select
+            if need_tmp3_pool
             else None
         )
         vec_bit1_base = (
             self.alloc_scratch("vec_bit1_pool", length=unroll * VLEN)
-            if enable_d3_select
+            if need_bit1_pool
+            else None
+        )
+        vec_bit2_base = (
+            self.alloc_scratch("vec_bit2_pool", length=unroll * VLEN)
+            if enable_d4_select
+            else None
+        )
+        vec_parity_base = (
+            self.alloc_scratch("vec_parity_pool", length=unroll * VLEN)
+            if enable_early_parity
             else None
         )
 
@@ -414,17 +455,33 @@ class KernelBuilder:
         vec_tmp2_u = [vec_tmp2_base + ui * VLEN for ui in range(unroll)]
         vec_tmp3_u = (
             [vec_tmp3_base + ui * VLEN for ui in range(unroll)]
-            if enable_d3_select
+            if need_tmp3_pool
             else None
         )
         vec_bit1_u = (
             [vec_bit1_base + ui * VLEN for ui in range(unroll)]
-            if enable_d3_select
+            if need_bit1_pool
+            else None
+        )
+        vec_bit2_u = (
+            [vec_bit2_base + ui * VLEN for ui in range(unroll)]
+            if enable_d4_select
+            else None
+        )
+        vec_parity_u = (
+            [vec_parity_base + ui * VLEN for ui in range(unroll)]
+            if enable_early_parity
             else None
         )
         vec_addr_val_u = [vec_addr_val_base + ui for ui in range(unroll)]
         vec_one = self.scratch_vconst(1)
         vec_two = self.scratch_vconst(2)
+        if enable_early_parity:
+            vec_parity_mask = self.scratch_vconst(0xEC3B475B)
+            vec_shift16 = self.scratch_vconst(16)
+            vec_shift8 = self.scratch_vconst(8)
+            vec_shift4 = self.scratch_vconst(4)
+            vec_shift2 = self.scratch_vconst(2)
         vec_forest_base = self.scratch_vbroadcast(self.scratch["forest_values_p"])
         addr_bias = self.alloc_scratch("addr_bias")
         base_plus1 = self.alloc_scratch("base_plus1")
@@ -441,6 +498,11 @@ class KernelBuilder:
         vec_base7_addr = (
             self.alloc_scratch("vec_base7_addr", length=VLEN)
             if enable_d3_select
+            else None
+        )
+        vec_base15_addr = (
+            self.alloc_scratch("vec_base15_addr", length=VLEN)
+            if enable_d4_select
             else None
         )
         body.append(("alu", ("-", addr_bias, one_const, self.scratch["forest_values_p"])))
@@ -461,12 +523,22 @@ class KernelBuilder:
         if enable_d3_select:
             vec_base7 = self.scratch_vconst(7)
             body.append(("valu", ("+", vec_base7_addr, vec_forest_base, vec_base7)))
+        if enable_d4_select:
+            vec_base15 = self.scratch_vconst(15)
+            body.append(("valu", ("+", vec_base15_addr, vec_forest_base, vec_base15)))
         forest3_6 = []
         forest3_6_consts = []
         vec_forest3_6 = []
         forest7_14 = []
         vec_forest7_14 = []
-        for idx in range(3, 15 if enable_d3_select else 7):
+        forest15_30 = []
+        vec_forest15_30 = []
+        max_small_idx = 7
+        if enable_d3_select:
+            max_small_idx = 15
+        if enable_d4_select:
+            max_small_idx = 31
+        for idx in range(3, max_small_idx):
             f = self.alloc_scratch(f"forest{idx}")
             vf = self.alloc_scratch(f"vec_forest{idx}", length=VLEN)
             idx_const = self.scratch_const(idx)
@@ -479,9 +551,12 @@ class KernelBuilder:
                 forest3_6.append(f)
                 forest3_6_consts.append(idx_const)
                 vec_forest3_6.append(vf)
-            elif enable_d3_select:
+            elif enable_d3_select and idx <= 14:
                 forest7_14.append(f)
                 vec_forest7_14.append(vf)
+            elif enable_d4_select and 15 <= idx <= 30:
+                forest15_30.append(f)
+                vec_forest15_30.append(vf)
 
         vec_limit = (batch_size // VLEN) * VLEN
         # Per-value pipeline: load each vector chunk once, run all rounds, then store once.
@@ -492,6 +567,9 @@ class KernelBuilder:
                 if base_u >= vec_limit:
                     break
                 valid_uis.append(ui)
+            group_size = int(os.getenv("HASH_GROUP", "0") or 0)
+            if group_size <= 0 or group_size > len(valid_uis):
+                group_size = len(valid_uis)
             # address setup + vload values (pointer bump by VLEN)
             base_const = self.scratch_const(base)
             body.append(
@@ -512,74 +590,163 @@ class KernelBuilder:
             for round in range(rounds):
                 depth = round % (forest_height + 1)
                 use_d3_select = enable_d3_select and depth == 3
+                use_d4_select = enable_d4_select and depth == 4
                 # gather node values
-                if depth not in (0, 1, 2) and not use_d3_select:
+                if depth not in (0, 1, 2) and not use_d3_select and not use_d4_select:
                     for ui in valid_uis:
                         for lane in range(VLEN):
                             body.append(("load", ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane)))
-                # process each vector (hash interleaved across unroll)
-                val_groups = []
-                addr_vecs = []
-                for ui in valid_uis:
-                    if depth == 0:
-                        body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_forest0)))
-                    elif depth == 1:
-                        body.append(("valu", ("-", vec_tmp1_u[ui], vec_addr_u[ui], vec_base1_addr)))
-                        body.append(("flow", ("vselect", vec_node_u[ui], vec_tmp1_u[ui], vec_forest2, vec_forest1)))
-                        body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
-                    elif depth == 2:
-                        body.extend(
-                            self.build_small_gather_select4_flow(
-                                vec_node_u[ui],
-                                vec_addr_u[ui],
-                                vec_base3_addr,
-                                vec_forest3_6,
-                                vec_tmp1_u[ui],
-                                vec_tmp2_u[ui],
-                                vec_tmp4,
-                                vec_one,
-                            )
-                        )
-                        body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
-                    elif depth == 3:
-                        if use_d3_select:
+                # process each vector (hash interleaved across group)
+                for gi in range(0, len(valid_uis), group_size):
+                    group = valid_uis[gi : gi + group_size]
+                    val_groups = []
+                    addr_vecs = []
+                    for ui in group:
+                        if depth == 0:
+                            body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_forest0)))
+                        elif depth == 1:
+                            body.append(("valu", ("-", vec_tmp1_u[ui], vec_addr_u[ui], vec_base1_addr)))
+                            body.append(("flow", ("vselect", vec_node_u[ui], vec_tmp1_u[ui], vec_forest2, vec_forest1)))
+                            body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
+                        elif depth == 2:
                             body.extend(
-                                self.build_small_gather_select8_flow(
+                                self.build_small_gather_select4_flow(
                                     vec_node_u[ui],
                                     vec_addr_u[ui],
-                                    vec_base7_addr,
-                                    vec_forest7_14,
+                                    vec_base3_addr,
+                                    vec_forest3_6,
                                     vec_tmp1_u[ui],
                                     vec_tmp2_u[ui],
-                                    vec_bit1_u[ui],
-                                    vec_tmp3_u[ui],
+                                    vec_tmp4,
                                     vec_one,
                                 )
                             )
                             body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
+                        elif depth == 3:
+                            if use_d3_select:
+                                body.extend(
+                                    self.build_small_gather_select8_flow(
+                                        vec_node_u[ui],
+                                        vec_addr_u[ui],
+                                        vec_base7_addr,
+                                        vec_forest7_14,
+                                        vec_tmp1_u[ui],
+                                        vec_tmp2_u[ui],
+                                        vec_bit1_u[ui],
+                                        vec_tmp3_u[ui],
+                                        vec_one,
+                                    )
+                                )
+                                body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
+                            else:
+                                body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
+                        elif depth == 4:
+                            if use_d4_select:
+                                if len(vec_forest15_30) != 16:
+                                    raise RuntimeError("Depth-4 select requires forest15..30 preloads")
+                                vals0_3 = vec_forest15_30[0:4]
+                                vals4_7 = vec_forest15_30[4:8]
+                                vals8_11 = vec_forest15_30[8:12]
+                                vals12_15 = vec_forest15_30[12:16]
+                                tmp_idx = vec_tmp1_u[ui]
+                                tmp_bit0 = vec_tmp2_u[ui]
+                                tmp_bit1 = vec_bit1_u[ui]
+                                tmp_bit2 = vec_bit2_u[ui]
+                                tmp_pair = vec_tmp3_u[ui]
+                                # bit0/bit1 from idx-base15
+                                body.append(("valu", ("-", tmp_idx, vec_addr_u[ui], vec_base15_addr)))
+                                body.append(("valu", ("&", tmp_bit0, tmp_idx, vec_one)))
+                                body.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("valu", ("&", tmp_bit1, tmp_idx, vec_one)))
+                                # upper half (8..15)
+                                body.extend(
+                                    self.build_select4_flow_bits(
+                                        vec_node_u[ui], tmp_bit0, tmp_bit1, vals8_11, tmp_pair
+                                    )
+                                )
+                                body.extend(
+                                    self.build_select4_flow_bits(
+                                        tmp_pair, tmp_bit0, tmp_bit1, vals12_15, tmp_bit2
+                                    )
+                                )
+                                # bit2/bit3 from shifted tmp_idx
+                                body.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("valu", ("&", tmp_bit2, tmp_idx, vec_one)))
+                                body.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("valu", ("&", tmp_idx, tmp_idx, vec_one)))
+                                # select upper half (h1) into dest
+                                body.append(("flow", ("vselect", vec_node_u[ui], tmp_bit2, tmp_pair, vec_node_u[ui])))
+                                # recompute bit0/bit1 for lower half
+                                body.append(("valu", ("-", tmp_idx, vec_addr_u[ui], vec_base15_addr)))
+                                body.append(("valu", ("&", tmp_bit0, tmp_idx, vec_one)))
+                                body.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("valu", ("&", tmp_bit1, tmp_idx, vec_one)))
+                                # lower half (0..7) -> tmp_pair/tmp_bit2
+                                body.extend(
+                                    self.build_select4_flow_bits(
+                                        tmp_pair, tmp_bit0, tmp_bit1, vals0_3, tmp_bit2
+                                    )
+                                )
+                                body.extend(
+                                    self.build_select4_flow_bits(
+                                        tmp_bit2, tmp_bit0, tmp_bit1, vals4_7, tmp_idx
+                                    )
+                                )
+                                # recompute bit2/bit3 for final combine
+                                body.append(("valu", ("-", tmp_idx, vec_addr_u[ui], vec_base15_addr)))
+                                body.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("valu", ("&", tmp_bit1, tmp_idx, vec_one)))
+                                body.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("valu", ("&", tmp_idx, tmp_idx, vec_one)))
+                                body.append(("flow", ("vselect", tmp_pair, tmp_bit1, tmp_bit2, tmp_pair)))
+                                body.append(("flow", ("vselect", vec_node_u[ui], tmp_idx, vec_node_u[ui], tmp_pair)))
+                                body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
+                            else:
+                                body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
                         else:
                             body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
-                    else:
-                        body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
-                    val_groups.append((vec_val_u[ui], vec_tmp1_u[ui], vec_tmp2_u[ui]))
-                    addr_vecs.append(vec_addr_u[ui])
-                body.extend(self.build_hash_vec_multi(val_groups, round, base))
-                for vi, (val_vec, t1, _t2) in enumerate(val_groups):
-                    addr_vec = addr_vecs[vi]
-                    if depth == forest_height:
-                        body.append(
-                            (
-                                "valu",
-                                ("vbroadcast", addr_vec, self.scratch["forest_values_p"]),
+                        if enable_early_parity:
+                            parity_vec = vec_parity_u[ui]
+                            tmp_shift = vec_tmp2_u[ui]
+                            body.append(("valu", ("&", parity_vec, vec_val_u[ui], vec_parity_mask)))
+                            body.append(("valu", (">>", tmp_shift, parity_vec, vec_shift16)))
+                            body.append(("valu", ("^", parity_vec, parity_vec, tmp_shift)))
+                            body.append(("valu", (">>", tmp_shift, parity_vec, vec_shift8)))
+                            body.append(("valu", ("^", parity_vec, parity_vec, tmp_shift)))
+                            body.append(("valu", (">>", tmp_shift, parity_vec, vec_shift4)))
+                            body.append(("valu", ("^", parity_vec, parity_vec, tmp_shift)))
+                            body.append(("valu", (">>", tmp_shift, parity_vec, vec_shift2)))
+                            body.append(("valu", ("^", parity_vec, parity_vec, tmp_shift)))
+                            body.append(("valu", (">>", tmp_shift, parity_vec, vec_one)))
+                            body.append(("valu", ("^", parity_vec, parity_vec, tmp_shift)))
+                            body.append(("valu", ("&", parity_vec, parity_vec, vec_one)))
+                            body.append(("valu", ("^", parity_vec, parity_vec, vec_one)))
+                        val_groups.append((vec_val_u[ui], vec_tmp1_u[ui], vec_tmp2_u[ui]))
+                        addr_vecs.append(vec_addr_u[ui])
+                    body.extend(self.build_hash_vec_multi(val_groups, round, base))
+                    if round == rounds - 1:
+                        continue
+                    for vi, (val_vec, t1, _t2) in enumerate(val_groups):
+                        addr_vec = addr_vecs[vi]
+                        if depth == forest_height:
+                            body.append(
+                                (
+                                    "valu",
+                                    ("vbroadcast", addr_vec, self.scratch["forest_values_p"]),
+                                )
                             )
-                        )
-                        continue
-                    body.append(("valu", ("&", t1, val_vec, vec_one)))
-                    if depth == 0:
-                        body.append(("valu", ("+", addr_vec, vec_base1_addr, t1)))
-                        continue
-                    body.append(("valu", ("multiply_add", addr_vec, addr_vec, vec_two, vec_addr_bias)))
-                    body.append(("valu", ("+", addr_vec, addr_vec, t1)))
+                            continue
+                        if enable_early_parity:
+                            parity_vec = vec_parity_u[group[vi]]
+                        else:
+                            body.append(("valu", ("&", t1, val_vec, vec_one)))
+                            parity_vec = t1
+                        if depth == 0:
+                            body.append(("valu", ("+", addr_vec, vec_base1_addr, parity_vec)))
+                            continue
+                        body.append(("valu", ("multiply_add", addr_vec, addr_vec, vec_two, vec_addr_bias)))
+                        body.append(("valu", ("+", addr_vec, addr_vec, parity_vec)))
                 if round == rounds - 1:
                     continue
             # store values once per chunk
@@ -784,11 +951,13 @@ def analyze_patterns(instrs, debug_info=None):
     tmp2_range = _range_for("vec_tmp2_pool")
     tmp3_range = _range_for("vec_tmp3_pool")
     bit1_range = _range_for("vec_bit1_pool")
+    bit2_range = _range_for("vec_bit2_pool")
     node_range = _range_for("vec_node_pool")
     tmp4_range = _range_for("vec_tmp4")
     base1_range = _range_for("vec_base1_addr")
     base3_range = _range_for("vec_base3_addr")
     base7_range = _range_for("vec_base7_addr")
+    base15_range = _range_for("vec_base15_addr")
     forest_ranges = _ranges_with_prefix("vec_forest")
     forest0_range = _range_for("vec_forest0")
     forest1_range = _range_for("vec_forest1")
@@ -805,6 +974,22 @@ def analyze_patterns(instrs, debug_info=None):
     forest12_range = _range_for("vec_forest12")
     forest13_range = _range_for("vec_forest13")
     forest14_range = _range_for("vec_forest14")
+    forest15_range = _range_for("vec_forest15")
+    forest16_range = _range_for("vec_forest16")
+    forest17_range = _range_for("vec_forest17")
+    forest18_range = _range_for("vec_forest18")
+    forest19_range = _range_for("vec_forest19")
+    forest20_range = _range_for("vec_forest20")
+    forest21_range = _range_for("vec_forest21")
+    forest22_range = _range_for("vec_forest22")
+    forest23_range = _range_for("vec_forest23")
+    forest24_range = _range_for("vec_forest24")
+    forest25_range = _range_for("vec_forest25")
+    forest26_range = _range_for("vec_forest26")
+    forest27_range = _range_for("vec_forest27")
+    forest28_range = _range_for("vec_forest28")
+    forest29_range = _range_for("vec_forest29")
+    forest30_range = _range_for("vec_forest30")
     forest_values_p_range = _range_for("forest_values_p")
 
     hash_ops = {"+", "^", "<<", ">>", "multiply_add"}
@@ -863,10 +1048,13 @@ def analyze_patterns(instrs, debug_info=None):
                 # Small-gather bit extraction from addr-based indices.
                 if op in ("-", "&", ">>") and _in_any(
                     dest,
-                    [tmp1_range, tmp2_range, tmp3_range, tmp4_range, bit1_range],
+                    [tmp1_range, tmp2_range, tmp3_range, tmp4_range, bit1_range, bit2_range],
                 ):
                     if any(
-                        _in_any(s, [addr_range, base1_range, base3_range, base7_range])
+                        _in_any(
+                            s,
+                            [addr_range, base1_range, base3_range, base7_range, base15_range],
+                        )
                         for s in srcs
                     ):
                         tags.add("small_gather")
@@ -964,6 +1152,55 @@ def analyze_patterns(instrs, debug_info=None):
                     ],
                 ):
                     depth_tags.add("d3")
+                # Depth 4: vselect using forest15..30 or base15 addr math.
+                if any(
+                    _in_any(
+                        s,
+                        [
+                            forest15_range,
+                            forest16_range,
+                            forest17_range,
+                            forest18_range,
+                            forest19_range,
+                            forest20_range,
+                            forest21_range,
+                            forest22_range,
+                            forest23_range,
+                            forest24_range,
+                            forest25_range,
+                            forest26_range,
+                            forest27_range,
+                            forest28_range,
+                            forest29_range,
+                            forest30_range,
+                            base15_range,
+                        ],
+                    )
+                    for s in srcs
+                ):
+                    depth_tags.add("d4")
+                if dest is not None and _in_any(
+                    dest,
+                    [
+                        forest15_range,
+                        forest16_range,
+                        forest17_range,
+                        forest18_range,
+                        forest19_range,
+                        forest20_range,
+                        forest21_range,
+                        forest22_range,
+                        forest23_range,
+                        forest24_range,
+                        forest25_range,
+                        forest26_range,
+                        forest27_range,
+                        forest28_range,
+                        forest29_range,
+                        forest30_range,
+                    ],
+                ):
+                    depth_tags.add("d4")
                 # Depth >=3: gather via load_offset into node pool.
                 if (
                     engine == "load"
