@@ -82,7 +82,50 @@ class KernelBuilder:
                 drop_valu = len(valu_idxs)
             drop_set = set(rng.sample(valu_idxs, drop_valu))
             slots = [slot for i, slot in enumerate(slots) if i not in drop_set]
-        return schedule_slots(slots, SLOT_LIMITS)
+        sched_weighted = os.getenv("SCHED_WEIGHTED", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_slack = os.getenv("SCHED_SLACK", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_global = os.getenv("SCHED_GLOBAL", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_repair = os.getenv("SCHED_REPAIR", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_mem = os.getenv("SCHED_MEM_DISAMBIG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        return schedule_slots(
+            slots,
+            SLOT_LIMITS,
+            weighted_priority=sched_weighted,
+            slack_tie_break=sched_slack,
+            global_pick=sched_global,
+            bundle_repair=sched_repair,
+            disambiguate_mem=sched_mem,
+        )
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})

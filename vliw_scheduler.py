@@ -205,6 +205,12 @@ def schedule_slots(
     window: int = 256,
     disambiguate_mem: bool = False,
     load_offset_reads_base: bool = False,
+    weighted_priority: bool = False,
+    slack_tie_break: bool = False,
+    priority_weights: Dict[str, int] | None = None,
+    global_pick: bool = False,
+    bundle_repair: bool = False,
+    repair_weight: int = 1,
 ) -> List[Dict[str, List[Tuple]]]:
     """
     Schedule a sequence of slots into VLIW bundles.
@@ -213,6 +219,10 @@ def schedule_slots(
     Priority is based on longest-path criticality in the dependency graph.
     Set disambiguate_mem=True to use affine address keys for memory ordering.
     Set load_offset_reads_base=True if load_offset uses base+imm addressing.
+    weighted_priority weights the critical path by engine type.
+    slack_tie_break prefers low-slack nodes when priorities tie.
+    global_pick selects the highest-priority ready ops across engines first.
+    bundle_repair tries a one-bundle lookahead swap using successor-unlock score.
     Returns a list of instruction bundles (dict of engine -> list of slots).
     """
     n = len(slots)
@@ -249,6 +259,8 @@ def schedule_slots(
 
         def mem_key_for_addr(addr_reg: int) -> tuple:
             # Group by base stream (base + offset + readonly sources) when known.
+            if addr_reg in const_val_by_reg:
+                return ("const", const_val_by_reg[addr_reg])
             key = affine_key(addr_reg)
             if key is None:
                 return ("reg", addr_reg)
@@ -264,12 +276,14 @@ def schedule_slots(
             return ("base", addr_reg, base_key)
 
     succ: Dict[int, List[int]] = defaultdict(list)
+    pred: List[List[int]] = [[] for _ in range(n)]
     indeg = [0] * n
 
     def add_edge(a: int, b: int) -> None:
         if a == b:
             return
         succ[a].append(b)
+        pred[b].append(a)
         indeg[b] += 1
 
     for i, ((engine, slot), dep) in enumerate(zip(slots, deps)):
@@ -382,6 +396,20 @@ def schedule_slots(
                     new_key = (base_reg, base_off, merged)
                 if new_key is not None:
                     affine_updates[dest] = new_key
+            elif engine == "alu" and slot[0] == "-":
+                _, dest, a1, a2 = slot
+                a1_const = const_val_by_reg.get(a1)
+                a2_const = const_val_by_reg.get(a2)
+                if a1_const is not None and a2_const is not None:
+                    const_updates[dest] = (a1_const - a2_const) % uint32_mod
+                a1_key = affine_key(a1)
+                if a1_key is not None and a2_const is not None:
+                    base_reg, base_off, sources = a1_key
+                    affine_updates[dest] = (
+                        base_reg,
+                        (base_off - a2_const) % uint32_mod,
+                        sources,
+                    )
 
             for w in dep.writes:
                 if w in const_updates:
@@ -393,7 +421,21 @@ def schedule_slots(
                 else:
                     affine_key_by_reg[w] = None
 
-    # Priority score: longest path to exit (criticality).
+    if weighted_priority:
+        if priority_weights is None:
+            priority_weights = {
+                "load": 3,
+                "store": 2,
+                "alu": 1,
+                "valu": 3,
+                "flow": 1,
+                "debug": 1,
+            }
+        weights = [max(1, priority_weights.get(slots[i][0], 1)) for i in range(n)]
+    else:
+        weights = [1] * n
+
+    # Priority score: (optionally weighted) longest path to exit (criticality).
     indeg_tmp = indeg.copy()
     topo: List[int] = []
     q = deque(i for i in range(n) if indeg_tmp[i] == 0)
@@ -404,13 +446,31 @@ def schedule_slots(
             indeg_tmp[nxt] -= 1
             if indeg_tmp[nxt] == 0:
                 q.append(nxt)
+    topo_ok = len(topo) == n
     if len(topo) != n:
         # Graph should be acyclic; fall back to program order if not.
         topo = list(range(n))
     priority = [0] * n
     for node in reversed(topo):
         if succ.get(node):
-            priority[node] = 1 + max(priority[nxt] for nxt in succ[node])
+            priority[node] = weights[node] + max(priority[nxt] for nxt in succ[node])
+        else:
+            priority[node] = weights[node]
+
+    slack = [0] * n
+    if slack_tie_break and topo_ok:
+        # Earliest-start computation for slack (weighted by engine).
+        asap = [0] * n
+        for node in topo:
+            if pred[node]:
+                asap[node] = max(asap[p] + weights[p] for p in pred[node])
+        makespan = 0
+        for node in range(n):
+            finish = asap[node] + priority[node]
+            if finish > makespan:
+                makespan = finish
+        for node in range(n):
+            slack[node] = makespan - (asap[node] + priority[node])
 
     # Ready queue (stable order)
     ready = deque(i for i in range(n) if indeg[i] == 0)
@@ -421,6 +481,8 @@ def schedule_slots(
 
     def ready_sort_key(idx: int) -> Tuple[int, int]:
         # Higher priority first, then lower original index.
+        if slack_tie_break:
+            return (-priority[idx], slack[idx], idx)
         return (-priority[idx], idx)
 
     while scheduled < n:
@@ -441,23 +503,32 @@ def schedule_slots(
             picked.append(idx)
             picked_set.add(idx)
 
-        # Fill each engine from the ready set using priority score.
-        for engine in engine_priority:
-            limit = slot_limits.get(engine, 0)
-            if limit == 0:
-                continue
-            candidates = [
-                idx
-                for idx in ready_list
-                if idx not in picked_set and slots[idx][0] == engine
-            ]
-            if not candidates:
-                continue
+        if global_pick:
+            candidates = [idx for idx in ready_list if idx not in picked_set]
             candidates.sort(key=ready_sort_key)
             for idx in candidates:
-                if used[engine] >= limit:
-                    break
+                engine = slots[idx][0]
+                if used[engine] >= slot_limits.get(engine, 0):
+                    continue
                 pick_idx(idx)
+        else:
+            # Fill each engine from the ready set using priority score.
+            for engine in engine_priority:
+                limit = slot_limits.get(engine, 0)
+                if limit == 0:
+                    continue
+                candidates = [
+                    idx
+                    for idx in ready_list
+                    if idx not in picked_set and slots[idx][0] == engine
+                ]
+                if not candidates:
+                    continue
+                candidates.sort(key=ready_sort_key)
+                for idx in candidates:
+                    if used[engine] >= limit:
+                        break
+                    pick_idx(idx)
 
         # Opportunistic fill: use remaining capacity across engines by priority.
         if any(used[e] < slot_limits.get(e, 0) for e in engine_priority):
@@ -468,6 +539,68 @@ def schedule_slots(
                 if used[engine] >= slot_limits.get(engine, 0):
                     continue
                 pick_idx(idx)
+
+        if bundle_repair and picked_set:
+            # One-bundle lookahead: prefer ops that unlock high-priority successors.
+            unlock_score: Dict[int, int] = {}
+            for idx in ready_list:
+                score = 0
+                for s in succ.get(idx, []):
+                    if indeg[s] == 1:
+                        score += priority[s]
+                unlock_score[idx] = score
+
+            def repair_score(idx: int) -> int:
+                return priority[idx] + repair_weight * unlock_score.get(idx, 0)
+
+            ready_unpicked = [idx for idx in ready_list if idx not in picked_set]
+            ready_unpicked.sort(
+                key=lambda i: (-repair_score(i), -priority[i], i)
+            )
+
+            for engine in engine_priority:
+                picked_engine = [i for i in picked_set if slots[i][0] == engine]
+                if not picked_engine:
+                    continue
+                unpicked_engine = [
+                    i for i in ready_unpicked if slots[i][0] == engine
+                ]
+                if not unpicked_engine:
+                    continue
+                picked_engine.sort(
+                    key=lambda i: (repair_score(i), priority[i], i)
+                )
+                unpicked_engine.sort(
+                    key=lambda i: (-repair_score(i), -priority[i], i)
+                )
+                swap_count = min(len(picked_engine), len(unpicked_engine))
+                for k in range(swap_count):
+                    out_idx = picked_engine[k]
+                    in_idx = unpicked_engine[k]
+                    if repair_score(in_idx) > repair_score(out_idx):
+                        picked_set.remove(out_idx)
+                        picked_set.add(in_idx)
+
+            if picked_set:
+                picked = sorted(picked_set)
+                bundle = {}
+                used = defaultdict(int)
+                for engine in engine_priority:
+                    limit = slot_limits.get(engine, 0)
+                    if limit == 0:
+                        continue
+                    indices = [
+                        idx for idx in picked if slots[idx][0] == engine
+                    ]
+                    if not indices:
+                        continue
+                    indices.sort()
+                    for idx in indices:
+                        if used[engine] >= limit:
+                            break
+                        slot_engine, slot = slots[idx]
+                        bundle.setdefault(engine, []).append(slot)
+                        used[engine] += 1
 
         if not picked:
             # If nothing was picked (e.g., only engines with 0 capacity), force-pick the first ready.
