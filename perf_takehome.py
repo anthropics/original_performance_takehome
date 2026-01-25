@@ -69,6 +69,10 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
+    def tag(self, text: str):
+        # Debug tags are ignored by submission simulator; useful for profiling.
+        self.instrs.append({"debug": [("tag", text)]})
+
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
@@ -134,6 +138,17 @@ class KernelBuilder:
                 slots.append(("valu", (op2, val_vec, t1, t2)))
         return slots
 
+    def build_vselect_vec(self, dest, cond, a, b, tmp_mask, tmp_notmask, vec_ones, vec_zero):
+        # Implement vselect via VALU ops to avoid flow bottleneck.
+        # mask = 0 - cond (0 -> 0x0, 1 -> 0xFFFFFFFF)
+        slots = []
+        slots.append(("valu", ("-", tmp_mask, vec_zero, cond)))
+        slots.append(("valu", ("^", tmp_notmask, tmp_mask, vec_ones)))
+        slots.append(("valu", ("&", dest, a, tmp_mask)))
+        slots.append(("valu", ("&", tmp_mask, b, tmp_notmask)))
+        slots.append(("valu", ("|", dest, dest, tmp_mask)))
+        return slots
+
     def build_kernel(
         self,
         forest_height: int,
@@ -197,37 +212,47 @@ class KernelBuilder:
                     unroll = int(os.getenv("VEC_UNROLL", "1"))
                 except ValueError:
                     unroll = 1
-            if unroll not in (1, 2, 4, 8):
+            if unroll not in (1, 2, 4, 8, 12, 16):
                 unroll = 1
+            if unroll > 8:
+                # Above 8, scratch usage and dependency complexity spike; cap for correctness.
+                unroll = 8
 
             inp_scratch = _env_flag("INP_SCRATCH")
             vec_tmp3 = self.alloc_scratch("vec_tmp3", length=VLEN)
 
-            vec_idx_u = []
-            vec_val_u = []
-            vec_node_u = []
-            vec_tmp1_u = []
-            vec_tmp2_u = []
-            vec_addr_u = []
-            vec_addr_idx_u = []
-            vec_addr_val_u = []
-            for ui in range(unroll):
-                vec_idx_u.append(self.alloc_scratch(f"vec_idx_{ui}", length=VLEN))
-                vec_val_u.append(self.alloc_scratch(f"vec_val_{ui}", length=VLEN))
-                vec_node_u.append(self.alloc_scratch(f"vec_node_{ui}", length=VLEN))
-                vec_tmp1_u.append(self.alloc_scratch(f"vec_tmp1_{ui}", length=VLEN))
-                vec_tmp2_u.append(self.alloc_scratch(f"vec_tmp2_{ui}", length=VLEN))
-                vec_addr_u.append(self.alloc_scratch(f"vec_addr_{ui}", length=VLEN))
-                vec_addr_idx_u.append(self.alloc_scratch(f"vec_addr_idx_{ui}"))
-                vec_addr_val_u.append(self.alloc_scratch(f"vec_addr_val_{ui}"))
+            # Allocate vector pools to avoid scratch overlap between different roles.
+            vec_idx_base = self.alloc_scratch("vec_idx_pool", length=unroll * VLEN)
+            vec_val_base = self.alloc_scratch("vec_val_pool", length=unroll * VLEN)
+            vec_node_base = self.alloc_scratch("vec_node_pool", length=unroll * VLEN)
+            vec_tmp1_base = self.alloc_scratch("vec_tmp1_pool", length=unroll * VLEN)
+            vec_tmp2_base = self.alloc_scratch("vec_tmp2_pool", length=unroll * VLEN)
+            vec_addr_base = self.alloc_scratch("vec_addr_pool", length=unroll * VLEN)
+            vec_addr_idx_base = self.alloc_scratch("vec_addr_idx_pool", length=unroll)
+            vec_addr_val_base = self.alloc_scratch("vec_addr_val_pool", length=unroll)
+
+            vec_idx_u = [vec_idx_base + ui * VLEN for ui in range(unroll)]
+            vec_val_u = [vec_val_base + ui * VLEN for ui in range(unroll)]
+            vec_node_u = [vec_node_base + ui * VLEN for ui in range(unroll)]
+            vec_tmp1_u = [vec_tmp1_base + ui * VLEN for ui in range(unroll)]
+            vec_tmp2_u = [vec_tmp2_base + ui * VLEN for ui in range(unroll)]
+            vec_addr_u = [vec_addr_base + ui * VLEN for ui in range(unroll)]
+            vec_addr_idx_u = [vec_addr_idx_base + ui for ui in range(unroll)]
+            vec_addr_val_u = [vec_addr_val_base + ui for ui in range(unroll)]
             if inp_scratch:
                 idx_buf = self.alloc_scratch("idx_buf", length=batch_size)
                 val_buf = self.alloc_scratch("val_buf", length=batch_size)
             vec_zero = self.scratch_vconst(0)
             vec_one = self.scratch_vconst(1)
             vec_two = self.scratch_vconst(2)
+            vec_ones = self.scratch_vconst(0xFFFFFFFF)
             vec_n_nodes = self.scratch_vbroadcast(self.scratch["n_nodes"])
             vec_forest_base = self.scratch_vbroadcast(self.scratch["forest_values_p"])
+            vselect_valu = _env_flag("VSELECT_VALU")
+            per_value_pipe = _env_flag("PER_VALUE_PIPE")
+            arith_select = _env_flag("ARITH_SELECT")
+            parity_and = _env_flag("PARITY_AND")
+            arith_wrap = _env_flag("ARITH_WRAP")
             small_gather = _env_flag("SMALL_GATHER")
             if small_gather:
                 forest0 = self.alloc_scratch("forest0")
@@ -246,77 +271,42 @@ class KernelBuilder:
                 body.append(("load", ("load", forest2, tmp_addr)))
                 body.append(("valu", ("vbroadcast", vec_forest2, forest2)))
 
-            for round in range(rounds):
-                vec_limit = (batch_size // VLEN) * VLEN
-                if inp_scratch and round == 0:
-                    for base in range(0, vec_limit, VLEN):
-                        base_const = self.scratch_const(base)
+            vec_limit = (batch_size // VLEN) * VLEN
+            if per_value_pipe:
+                # Per-value pipeline: load each vector chunk once, run all rounds, then store once.
+                for base in range(0, vec_limit, VLEN * unroll):
+                    # address setup + vload idx/val
+                    for ui in range(unroll):
+                        base_u = base + ui * VLEN
+                        if base_u >= vec_limit:
+                            continue
+                        base_u_const = self.scratch_const(base_u)
                         body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], base_const))
+                            (
+                                "alu",
+                                (
+                                    "+",
+                                    vec_addr_idx_u[ui],
+                                    self.scratch["inp_indices_p"],
+                                    base_u_const,
+                                ),
+                            )
                         )
-                        body.append(("load", ("vload", idx_buf + base, tmp_addr)))
                         body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_const))
+                            (
+                                "alu",
+                                (
+                                    "+",
+                                    vec_addr_val_u[ui],
+                                    self.scratch["inp_values_p"],
+                                    base_u_const,
+                                ),
+                            )
                         )
-                        body.append(("load", ("vload", val_buf + base, tmp_addr)))
-                    for i in range(vec_limit, batch_size):
-                        i_const = self.scratch_const(i)
-                        body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                        )
-                        body.append(("load", ("load", idx_buf + i, tmp_addr)))
-                        body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                        )
-                        body.append(("load", ("load", val_buf + i, tmp_addr)))
-                if unroll > 0:
-                    for base in range(0, vec_limit, VLEN * unroll):
-                        # address setup
-                        for ui in range(unroll):
-                            base_u = base + ui * VLEN
-                            if base_u >= vec_limit:
-                                continue
-                            if not inp_scratch:
-                                base_u_const = self.scratch_const(base_u)
-                                body.append(
-                                    (
-                                        "alu",
-                                        (
-                                            "+",
-                                            vec_addr_idx_u[ui],
-                                            self.scratch["inp_indices_p"],
-                                            base_u_const,
-                                        ),
-                                    )
-                                )
-                                body.append(
-                                    (
-                                        "alu",
-                                        (
-                                            "+",
-                                            vec_addr_val_u[ui],
-                                            self.scratch["inp_values_p"],
-                                            base_u_const,
-                                        ),
-                                    )
-                                )
+                        body.append(("load", ("vload", vec_idx_u[ui], vec_addr_idx_u[ui])))
+                        body.append(("load", ("vload", vec_val_u[ui], vec_addr_val_u[ui])))
 
-                        # vload idx/val
-                        for ui in range(unroll):
-                            base_u = base + ui * VLEN
-                            if base_u >= vec_limit:
-                                continue
-                            if inp_scratch:
-                                vec_idx_u[ui] = idx_buf + base_u
-                                vec_val_u[ui] = val_buf + base_u
-                            else:
-                                body.append(
-                                    ("load", ("vload", vec_idx_u[ui], vec_addr_idx_u[ui]))
-                                )
-                                body.append(
-                                    ("load", ("vload", vec_val_u[ui], vec_addr_val_u[ui]))
-                                )
-
+                    for round in range(rounds):
                         # gather node values
                         if not (small_gather and round in (0, 1)):
                             for ui in range(unroll):
@@ -340,8 +330,6 @@ class KernelBuilder:
                         # process each vector (hash interleaved across unroll)
                         val_groups = []
                         idx_vecs = []
-                        addr_idx_vecs = []
-                        addr_val_vecs = []
                         for ui in range(unroll):
                             base_u = base + ui * VLEN
                             if base_u >= vec_limit:
@@ -356,9 +344,35 @@ class KernelBuilder:
                             elif small_gather and round == 1:
                                 # idx is 1 or 2; select forest1/forest2 based on idx % 2
                                 body.append(("valu", ("%", vec_tmp1_u[ui], vec_idx_u[ui], vec_two)))
-                                body.append(
-                                    ("flow", ("vselect", vec_node_u[ui], vec_tmp1_u[ui], vec_forest1, vec_forest2))
-                                )
+                                if arith_select:
+                                    # node = forest2 ^ ((forest1 ^ forest2) & mask)
+                                    body.append(
+                                        ("valu", ("^", vec_tmp2_u[ui], vec_forest1, vec_forest2))
+                                    )
+                                    body.append(("valu", ("-", vec_tmp3, vec_zero, vec_tmp1_u[ui])))
+                                    body.append(
+                                        ("valu", ("&", vec_tmp2_u[ui], vec_tmp2_u[ui], vec_tmp3))
+                                    )
+                                    body.append(
+                                        ("valu", ("^", vec_node_u[ui], vec_forest2, vec_tmp2_u[ui]))
+                                    )
+                                elif vselect_valu:
+                                    body.extend(
+                                        self.build_vselect_vec(
+                                            vec_node_u[ui],
+                                            vec_tmp1_u[ui],
+                                            vec_forest1,
+                                            vec_forest2,
+                                            vec_tmp1_u[ui],
+                                            vec_tmp2_u[ui],
+                                            vec_ones,
+                                            vec_zero,
+                                        )
+                                    )
+                                else:
+                                    body.append(
+                                        ("flow", ("vselect", vec_node_u[ui], vec_tmp1_u[ui], vec_forest1, vec_forest2))
+                                    )
                                 body.append(
                                     (
                                         "valu",
@@ -374,57 +388,77 @@ class KernelBuilder:
                                 )
                             val_groups.append((vec_val_u[ui], vec_tmp1_u[ui], vec_tmp2_u[ui]))
                             idx_vecs.append(vec_idx_u[ui])
-                            addr_idx_vecs.append(vec_addr_idx_u[ui])
-                            addr_val_vecs.append(vec_addr_val_u[ui])
 
-                        body.extend(
-                            self.build_hash_vec_multi(
-                                val_groups, round, base
-                            )
-                        )
+                        body.extend(self.build_hash_vec_multi(val_groups, round, base))
 
                         for vi, (val_vec, t1, _t2) in enumerate(val_groups):
                             idx_vec = idx_vecs[vi]
-                            body.append(("valu", ("%", t1, val_vec, vec_two)))
-                            body.append(("valu", ("==", t1, t1, vec_zero)))
-                            body.append(
-                                ("flow", ("vselect", vec_tmp3, t1, vec_one, vec_two))
-                            )
+                            if parity_and:
+                                body.append(("valu", ("&", t1, val_vec, vec_one)))
+                                body.append(("valu", ("+", vec_tmp3, t1, vec_one)))
+                            else:
+                                body.append(("valu", ("%", t1, val_vec, vec_two)))
+                                body.append(("valu", ("==", t1, t1, vec_zero)))
+                                if arith_select:
+                                    body.append(("valu", ("-", vec_tmp3, vec_two, t1)))
+                                elif vselect_valu:
+                                    body.extend(
+                                        self.build_vselect_vec(
+                                            vec_tmp3,
+                                            t1,
+                                            vec_one,
+                                            vec_two,
+                                            t1,
+                                            vec_tmp2_u[vi],
+                                            vec_ones,
+                                            vec_zero,
+                                        )
+                                    )
+                                else:
+                                    body.append(
+                                        ("flow", ("vselect", vec_tmp3, t1, vec_one, vec_two))
+                                    )
                             body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
                             body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
                             body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
-                            body.append(
-                                ("flow", ("vselect", idx_vec, t1, idx_vec, vec_zero))
-                            )
-                            if not inp_scratch:
-                                body.append(
-                                    ("store", ("vstore", addr_idx_vecs[vi], idx_vec))
+                            if arith_wrap:
+                                body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                            elif arith_select:
+                                body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                            elif vselect_valu:
+                                body.extend(
+                                    self.build_vselect_vec(
+                                        idx_vec,
+                                        t1,
+                                        idx_vec,
+                                        vec_zero,
+                                        t1,
+                                        vec_tmp2_u[vi],
+                                        vec_ones,
+                                        vec_zero,
+                                    )
                                 )
+                            else:
                                 body.append(
-                                    ("store", ("vstore", addr_val_vecs[vi], val_vec))
+                                    ("flow", ("vselect", idx_vec, t1, idx_vec, vec_zero))
                                 )
+
+                    # store idx/val once per chunk
+                    for ui in range(unroll):
+                        base_u = base + ui * VLEN
+                        if base_u >= vec_limit:
+                            continue
+                        body.append(("store", ("vstore", vec_addr_idx_u[ui], vec_idx_u[ui])))
+                        body.append(("store", ("vstore", vec_addr_val_u[ui], vec_val_u[ui])))
+
                 # tail (scalar)
                 for i in range(vec_limit, batch_size):
-                    if inp_scratch:
-                        idx_addr = idx_buf + i
-                        val_addr = val_buf + i
-                        body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_addr)))
-                        body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                        body.append(("alu", ("^", val_addr, val_addr, tmp_node_val)))
-                        body.extend(self.build_hash(val_addr, tmp1, tmp2, round, i))
-                        body.append(("alu", ("%", tmp1, val_addr, two_const)))
-                        body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                        body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                        body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
-                        body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
-                        body.append(("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"])))
-                        body.append(("flow", ("select", idx_addr, tmp1, idx_addr, zero_const)))
-                    else:
-                        i_const = self.scratch_const(i)
-                        body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                        body.append(("load", ("load", tmp_idx, tmp_addr)))
-                        body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                        body.append(("load", ("load", tmp_val, tmp_addr)))
+                    i_const = self.scratch_const(i)
+                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                    body.append(("load", ("load", tmp_idx, tmp_addr)))
+                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                    body.append(("load", ("load", tmp_val, tmp_addr)))
+                    for round in range(rounds):
                         body.append(
                             ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
                         )
@@ -438,31 +472,293 @@ class KernelBuilder:
                         body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
                         body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
                         body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                        body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                        body.append(("store", ("store", tmp_addr, tmp_idx)))
-                        body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                        body.append(("store", ("store", tmp_addr, tmp_val)))
-                if inp_scratch and round == rounds - 1:
-                    for base in range(0, vec_limit, VLEN):
-                        base_const = self.scratch_const(base)
-                        body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], base_const))
-                        )
-                        body.append(("store", ("vstore", tmp_addr, idx_buf + base)))
-                        body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_const))
-                        )
-                        body.append(("store", ("vstore", tmp_addr, val_buf + base)))
+                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                    body.append(("store", ("store", tmp_addr, tmp_idx)))
+                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                    body.append(("store", ("store", tmp_addr, tmp_val)))
+            else:
+                for round in range(rounds):
+                    if inp_scratch and round == 0:
+                        for base in range(0, vec_limit, VLEN):
+                            base_const = self.scratch_const(base)
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], base_const))
+                            )
+                            body.append(("load", ("vload", idx_buf + base, tmp_addr)))
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_const))
+                            )
+                            body.append(("load", ("vload", val_buf + base, tmp_addr)))
+                        for i in range(vec_limit, batch_size):
+                            i_const = self.scratch_const(i)
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                            )
+                            body.append(("load", ("load", idx_buf + i, tmp_addr)))
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
+                            )
+                            body.append(("load", ("load", val_buf + i, tmp_addr)))
+                    if unroll > 0:
+                        for base in range(0, vec_limit, VLEN * unroll):
+                            # address setup
+                            for ui in range(unroll):
+                                base_u = base + ui * VLEN
+                                if base_u >= vec_limit:
+                                    continue
+                                if not inp_scratch:
+                                    base_u_const = self.scratch_const(base_u)
+                                    body.append(
+                                        (
+                                            "alu",
+                                            (
+                                                "+",
+                                                vec_addr_idx_u[ui],
+                                                self.scratch["inp_indices_p"],
+                                                base_u_const,
+                                            ),
+                                        )
+                                    )
+                                    body.append(
+                                        (
+                                            "alu",
+                                            (
+                                                "+",
+                                                vec_addr_val_u[ui],
+                                                self.scratch["inp_values_p"],
+                                                base_u_const,
+                                            ),
+                                        )
+                                    )
+
+                            # vload idx/val
+                            for ui in range(unroll):
+                                base_u = base + ui * VLEN
+                                if base_u >= vec_limit:
+                                    continue
+                                if inp_scratch:
+                                    vec_idx_u[ui] = idx_buf + base_u
+                                    vec_val_u[ui] = val_buf + base_u
+                                else:
+                                    self.tag(f"round={round} base={base_u} ui={ui} kind=idx")
+                                    body.append(
+                                        ("load", ("vload", vec_idx_u[ui], vec_addr_idx_u[ui]))
+                                    )
+                                    self.tag(f"round={round} base={base_u} ui={ui} kind=val")
+                                    body.append(
+                                        ("load", ("vload", vec_val_u[ui], vec_addr_val_u[ui]))
+                                    )
+
+                            # gather node values
+                            if not (small_gather and round in (0, 1)):
+                                for ui in range(unroll):
+                                    base_u = base + ui * VLEN
+                                    if base_u >= vec_limit:
+                                        continue
+                                    body.append(
+                                        (
+                                            "valu",
+                                            ("+", vec_addr_u[ui], vec_forest_base, vec_idx_u[ui]),
+                                        )
+                                    )
+                                    for lane in range(VLEN):
+                                        body.append(
+                                            (
+                                                "load",
+                                                ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane),
+                                            )
+                                        )
+
+                            # process each vector (hash interleaved across unroll)
+                            val_groups = []
+                            idx_vecs = []
+                            addr_idx_vecs = []
+                            addr_val_vecs = []
+                            for ui in range(unroll):
+                                base_u = base + ui * VLEN
+                                if base_u >= vec_limit:
+                                    continue
+                                if small_gather and round == 0:
+                                    body.append(
+                                        (
+                                            "valu",
+                                            ("^", vec_val_u[ui], vec_val_u[ui], vec_forest0),
+                                        )
+                                    )
+                                elif small_gather and round == 1:
+                                    # idx is 1 or 2; select forest1/forest2 based on idx % 2
+                                    body.append(("valu", ("%", vec_tmp1_u[ui], vec_idx_u[ui], vec_two)))
+                                    if arith_select:
+                                        # node = forest2 ^ ((forest1 ^ forest2) & mask)
+                                        body.append(
+                                            ("valu", ("^", vec_tmp2_u[ui], vec_forest1, vec_forest2))
+                                        )
+                                        body.append(("valu", ("-", vec_tmp3, vec_zero, vec_tmp1_u[ui])))
+                                        body.append(
+                                            ("valu", ("&", vec_tmp2_u[ui], vec_tmp2_u[ui], vec_tmp3))
+                                        )
+                                        body.append(
+                                            ("valu", ("^", vec_node_u[ui], vec_forest2, vec_tmp2_u[ui]))
+                                        )
+                                    elif vselect_valu:
+                                        body.extend(
+                                            self.build_vselect_vec(
+                                                vec_node_u[ui],
+                                                vec_tmp1_u[ui],
+                                                vec_forest1,
+                                                vec_forest2,
+                                                vec_tmp1_u[ui],
+                                                vec_tmp2_u[ui],
+                                                vec_ones,
+                                                vec_zero,
+                                            )
+                                        )
+                                    else:
+                                        body.append(
+                                            ("flow", ("vselect", vec_node_u[ui], vec_tmp1_u[ui], vec_forest1, vec_forest2))
+                                        )
+                                    body.append(
+                                        (
+                                            "valu",
+                                            ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
+                                        )
+                                    )
+                                else:
+                                    body.append(
+                                        (
+                                            "valu",
+                                            ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
+                                        )
+                                    )
+                                val_groups.append((vec_val_u[ui], vec_tmp1_u[ui], vec_tmp2_u[ui]))
+                                idx_vecs.append(vec_idx_u[ui])
+                                addr_idx_vecs.append(vec_addr_idx_u[ui])
+                                addr_val_vecs.append(vec_addr_val_u[ui])
+
+                            body.extend(
+                                self.build_hash_vec_multi(
+                                    val_groups, round, base
+                                )
+                            )
+
+                            for vi, (val_vec, t1, _t2) in enumerate(val_groups):
+                                idx_vec = idx_vecs[vi]
+                                if parity_and:
+                                    body.append(("valu", ("&", t1, val_vec, vec_one)))
+                                    body.append(("valu", ("+", vec_tmp3, t1, vec_one)))
+                                else:
+                                    body.append(("valu", ("%", t1, val_vec, vec_two)))
+                                    body.append(("valu", ("==", t1, t1, vec_zero)))
+                                    if arith_select:
+                                        body.append(("valu", ("-", vec_tmp3, vec_two, t1)))
+                                    elif vselect_valu:
+                                        body.extend(
+                                            self.build_vselect_vec(
+                                                vec_tmp3,
+                                                t1,
+                                                vec_one,
+                                                vec_two,
+                                                t1,
+                                                vec_tmp2_u[vi],
+                                                vec_ones,
+                                                vec_zero,
+                                            )
+                                        )
+                                    else:
+                                        body.append(
+                                            ("flow", ("vselect", vec_tmp3, t1, vec_one, vec_two))
+                                        )
+                                body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
+                                body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
+                                body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
+                                if arith_wrap:
+                                    body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                                elif arith_select:
+                                    body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                                elif vselect_valu:
+                                    body.extend(
+                                        self.build_vselect_vec(
+                                            idx_vec,
+                                            t1,
+                                            idx_vec,
+                                            vec_zero,
+                                            t1,
+                                            vec_tmp2_u[vi],
+                                            vec_ones,
+                                            vec_zero,
+                                        )
+                                    )
+                                else:
+                                    body.append(
+                                        ("flow", ("vselect", idx_vec, t1, idx_vec, vec_zero))
+                                    )
+                                if not inp_scratch:
+                                    body.append(
+                                        ("store", ("vstore", addr_idx_vecs[vi], idx_vec))
+                                    )
+                                    body.append(
+                                        ("store", ("vstore", addr_val_vecs[vi], val_vec))
+                                    )
+                    # tail (scalar)
                     for i in range(vec_limit, batch_size):
-                        i_const = self.scratch_const(i)
-                        body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                        )
-                        body.append(("store", ("store", tmp_addr, idx_buf + i)))
-                        body.append(
-                            ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                        )
-                        body.append(("store", ("store", tmp_addr, val_buf + i)))
+                        if inp_scratch:
+                            idx_addr = idx_buf + i
+                            val_addr = val_buf + i
+                            body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_addr)))
+                            body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                            body.append(("alu", ("^", val_addr, val_addr, tmp_node_val)))
+                            body.extend(self.build_hash(val_addr, tmp1, tmp2, round, i))
+                            body.append(("alu", ("%", tmp1, val_addr, two_const)))
+                            body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                            body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                            body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
+                            body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
+                            body.append(("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"])))
+                            body.append(("flow", ("select", idx_addr, tmp1, idx_addr, zero_const)))
+                        else:
+                            i_const = self.scratch_const(i)
+                            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                            body.append(("load", ("load", tmp_idx, tmp_addr)))
+                            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                            body.append(("load", ("load", tmp_val, tmp_addr)))
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
+                            )
+                            body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                            body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                            body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+                            body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+                            body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                            body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                            body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                            body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+                            body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+                            body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+                            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                            body.append(("store", ("store", tmp_addr, tmp_idx)))
+                            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                            body.append(("store", ("store", tmp_addr, tmp_val)))
+                    if inp_scratch and round == rounds - 1:
+                        for base in range(0, vec_limit, VLEN):
+                            base_const = self.scratch_const(base)
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], base_const))
+                            )
+                            body.append(("store", ("vstore", tmp_addr, idx_buf + base)))
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], base_const))
+                            )
+                            body.append(("store", ("vstore", tmp_addr, val_buf + base)))
+                        for i in range(vec_limit, batch_size):
+                            i_const = self.scratch_const(i)
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                            )
+                            body.append(("store", ("store", tmp_addr, idx_buf + i)))
+                            body.append(
+                                ("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
+                            )
+                            body.append(("store", ("store", tmp_addr, val_buf + i)))
         else:
             for round in range(rounds):
                 for i in range(batch_size):
@@ -519,6 +815,8 @@ def do_kernel_test(
     prints: bool = False,
     vliw: bool = False,
 ):
+    if _env_flag("BITSLICE_PROFILE"):
+        _bitslice_profile()
     if _env_flag("IDX_PROFILE"):
         random.seed(seed)
         forest = Tree.generate(forest_height)
@@ -596,6 +894,41 @@ def do_kernel_test(
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
     return machine.cycle
+
+
+def _bitslice_profile(vlen: int = VLEN):
+    """
+    Prototype: estimate bit-sliced op cost for the hash.
+    This does NOT change kernel behavior; it only prints an estimate.
+    """
+    # Bit-sliced add: ripple-carry using xor/and/or
+    def add_cost(bits: int):
+        # sum = a ^ b ^ c; carry = (a&b) | (c & (a^b))
+        # per bit: xor*2, and*2, or*1 => 5 ops
+        return bits * 5
+
+    # Bit-sliced xor cost: 1 op per bit
+    def xor_cost(bits: int):
+        return bits
+
+    # Bit-sliced shift cost: treat as wiring (no ops), but in software you'd just reindex.
+    def shift_cost(_bits: int):
+        return 0
+
+    total = 0
+    bits = 32
+    for op1, _val1, op2, op3, _val3 in HASH_STAGES:
+        # op1(a, const) cost
+        total += add_cost(bits) if op1 == "+" else xor_cost(bits)
+        # op3(a, shift) cost
+        total += shift_cost(bits)
+        # op2(t1, t2) cost
+        if op2 == "+":
+            total += add_cost(bits)
+        elif op2 == "^":
+            total += xor_cost(bits)
+    print(f"BITSLICE_PROFILE: est bitwise ops per value = {total}")
+    print("  note: ignores data movement + gather; intended as rough feasibility check")
 
 
 def _parse_args():
