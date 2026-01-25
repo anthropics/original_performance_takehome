@@ -42,6 +42,7 @@ approximate cycle impact. All cycle numbers refer to the default workload
 ## Small-domain gather (exact)
 - Round 0 (idx always 0): remove gather entirely (use forest[0] broadcast).
 - Round 1 (idx in {1,2}): vselect between forest[1]/forest[2].
+- Depth 3 (idx in 7..14): preload forest[7..14], 8-way flow vselect; ~1,503 cycles (from ~1,534).
 - With VEC_UNROLL=8 + SMALL_GATHER round 0/1: ~2,536 cycles (best so far).
 
 ## Per-value pipeline (rounds inside vector chunk)
@@ -162,8 +163,8 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - Gather loads + VALU remain near limits; flow largely removed. Further gains likely need fewer gathers or hash simplification.
 
 ## Current best settings
-- Best path is now hardcoded (flags removed): VEC+VLIW, unroll=20, per‑value pipeline, depth‑0/1/2 small‑gather, parity via AND, idx update via multiply_add, depth‑0 direct idx, max‑depth idx=0.
-- ~1,534 cycles with scheduler flags (`SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1`).
+- Best path is now hardcoded (flags removed): VEC+VLIW, unroll=20, per‑value pipeline, depth‑0/1/2/3 small‑gather, parity via AND, idx update via multiply_add, depth‑0 direct idx, max‑depth idx=0.
+- ~1,503 cycles with scheduler flags (`SCHED_MEM_DISAMBIG=1 SCHED_REPAIR=1`).
 
 ### Slot utilization and bundle counts
 Engine | Avg/Max | Bundles (profile @ ~1,534 cycles)
