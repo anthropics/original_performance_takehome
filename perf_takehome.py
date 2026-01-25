@@ -117,6 +117,20 @@ class KernelBuilder:
             "y",
             "on",
         }
+        sched_rename = os.getenv("SCHED_RENAME", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        sched_stats = os.getenv("SCHED_STATS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
         return schedule_slots(
             slots,
             SLOT_LIMITS,
@@ -125,6 +139,8 @@ class KernelBuilder:
             global_pick=sched_global,
             bundle_repair=sched_repair,
             disambiguate_mem=sched_mem,
+            rename_war_waw=sched_rename,
+            debug_stats=sched_stats,
         )
 
     def add(self, engine, slot):
