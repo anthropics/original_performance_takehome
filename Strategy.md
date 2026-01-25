@@ -59,6 +59,7 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - Depth-2 flow selector (SMALL_GATHER_D2_FLOW): small win; cycles ~1,899 (down from 1,969) but still above targets.
 - Depth-3 flow selector with range guard (SMALL_GATHER_D3_FLOW): correct but slow (~2,457 cycles); not worth using.
 - Depth-3 VALU arithmetic selector (idx 7..14 with multiply_add): regressed (~1,738 cycles); rolled back.
+- Depth-3 VALU mask selector (8-way, no flow/gather): regressed (~1,876 cycles); rolled back.
 
 ## Hash simplification (attempts)
 - Scalarize XOR-stage op1 (SCALAR_XOR_OP1=1): regressed (~2,162 cycles); not useful.
@@ -86,6 +87,11 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - VEC_UNROLL=12: slightly worse (~2,567 cycles).
 - VEC_UNROLL=16: works in current kernel; ~1,664 cycles (new best).
 - Current kernel profile (unroll=20): ~1,650 cycles. Bundles (profile @ ~1,650): alu 1,249, flow 258, load 1,432, store 31, valu 1,556.
+
+## Address setup (stride/pointer bump)
+- Pointer-bump unrolled vector addresses by +VLEN instead of per-ui base constants:
+  - ~1,637 cycles (improves ~1,650).
+  - PROFILE=1 bundles: alu 1,251, flow 258, load 1,396, store 32, valu 1,575.
 
 ## Bit-slicing feasibility
 - Bit-slice cost estimate: ~1,280 bitwise ops per value per hash (too expensive to pursue).
@@ -124,6 +130,9 @@ approximate cycle impact. All cycle numbers refer to the default workload
 ### Unroll > 8
 - Worse or incorrect; scratch pressure and correctness issues.
 
+### Address setup (pointer bump)
+- Small win by reducing ALU address setup overhead and constant pressure.
+
 ### Round 2/3 selector attempts
 - Incorrect or slower; rolled back.
 
@@ -135,12 +144,12 @@ approximate cycle impact. All cycle numbers refer to the default workload
 
 ## Current best settings
 - Best path is now hardcoded (flags removed): VEC+VLIW, unroll=20, per‑value pipeline, depth‑0/1/2 small‑gather, parity via AND, idx update via multiply_add, depth‑0 direct idx, max‑depth idx=0.
-- ~1,650 cycles (still above 1,579 but closer).
+- ~1,637 cycles (still above 1,579 but closer).
 
 ### Slot utilization and bundle counts
-Engine | Avg/Max | Bundles (profile @ ~1,650 cycles)
-alu | 9.87 / 12 | 1,249
-valu | 4.44 / 6 | 1,556
-load | 1.86 / 2 | 1,432
-store | 1.03 / 2 | 31
+Engine | Avg/Max | Bundles (profile @ ~1,637 cycles)
+alu | 9.86 / 12 | 1,251
+valu | 4.38 / 6 | 1,575
+load | 1.89 / 2 | 1,396
+store | 1.00 / 2 | 32
 flow | 1.00 / 1 | 258
