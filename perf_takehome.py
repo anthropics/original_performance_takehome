@@ -134,8 +134,13 @@ class KernelBuilder:
                 slots.append(("valu", (op1, t1, val_vec, c1)))
             for val_vec, _t1, t2 in val_groups:
                 slots.append(("valu", (op3, t2, val_vec, c3)))
-            for val_vec, t1, t2 in val_groups:
-                slots.append(("valu", (op2, val_vec, t1, t2)))
+            if _env_flag("SCALAR_OP2") and op2 in ("+", "^"):
+                for val_vec, t1, t2 in val_groups:
+                    for lane in range(VLEN):
+                        slots.append(("alu", (op2, val_vec + lane, t1 + lane, t2 + lane)))
+            else:
+                for val_vec, t1, t2 in val_groups:
+                    slots.append(("valu", (op2, val_vec, t1, t2)))
         return slots
 
     def build_vselect_vec(self, dest, cond, a, b, tmp_mask, tmp_notmask, vec_ones, vec_zero):
@@ -253,6 +258,7 @@ class KernelBuilder:
             arith_select = _env_flag("ARITH_SELECT")
             parity_and = _env_flag("PARITY_AND")
             arith_wrap = _env_flag("ARITH_WRAP")
+            skip_wrap = _env_flag("SKIP_WRAP")
             small_gather = _env_flag("SMALL_GATHER")
             if small_gather:
                 forest0 = self.alloc_scratch("forest0")
@@ -307,8 +313,9 @@ class KernelBuilder:
                         body.append(("load", ("vload", vec_val_u[ui], vec_addr_val_u[ui])))
 
                     for round in range(rounds):
+                        depth = round % (forest_height + 1)
                         # gather node values
-                        if not (small_gather and round in (0, 1)):
+                        if not (small_gather and depth in (0, 1)):
                             for ui in range(unroll):
                                 base_u = base + ui * VLEN
                                 if base_u >= vec_limit:
@@ -334,14 +341,14 @@ class KernelBuilder:
                             base_u = base + ui * VLEN
                             if base_u >= vec_limit:
                                 continue
-                            if small_gather and round == 0:
+                            if small_gather and depth == 0:
                                 body.append(
                                     (
                                         "valu",
                                         ("^", vec_val_u[ui], vec_val_u[ui], vec_forest0),
                                     )
                                 )
-                            elif small_gather and round == 1:
+                            elif small_gather and depth == 1:
                                 # idx is 1 or 2; select forest1/forest2 based on idx % 2
                                 body.append(("valu", ("%", vec_tmp1_u[ui], vec_idx_u[ui], vec_two)))
                                 if arith_select:
@@ -420,28 +427,29 @@ class KernelBuilder:
                                     )
                             body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
                             body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
-                            body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
-                            if arith_wrap:
-                                body.append(("valu", ("*", idx_vec, idx_vec, t1)))
-                            elif arith_select:
-                                body.append(("valu", ("*", idx_vec, idx_vec, t1)))
-                            elif vselect_valu:
-                                body.extend(
-                                    self.build_vselect_vec(
-                                        idx_vec,
-                                        t1,
-                                        idx_vec,
-                                        vec_zero,
-                                        t1,
-                                        vec_tmp2_u[vi],
-                                        vec_ones,
-                                        vec_zero,
+                            if not (skip_wrap and depth < forest_height):
+                                body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
+                                if arith_wrap:
+                                    body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                                elif arith_select:
+                                    body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                                elif vselect_valu:
+                                    body.extend(
+                                        self.build_vselect_vec(
+                                            idx_vec,
+                                            t1,
+                                            idx_vec,
+                                            vec_zero,
+                                            t1,
+                                            vec_tmp2_u[vi],
+                                            vec_ones,
+                                            vec_zero,
+                                        )
                                     )
-                                )
-                            else:
-                                body.append(
-                                    ("flow", ("vselect", idx_vec, t1, idx_vec, vec_zero))
-                                )
+                                else:
+                                    body.append(
+                                        ("flow", ("vselect", idx_vec, t1, idx_vec, vec_zero))
+                                    )
 
                     # store idx/val once per chunk
                     for ui in range(unroll):
@@ -459,6 +467,7 @@ class KernelBuilder:
                     body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                     body.append(("load", ("load", tmp_val, tmp_addr)))
                     for round in range(rounds):
+                        depth = round % (forest_height + 1)
                         body.append(
                             ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
                         )
@@ -470,14 +479,16 @@ class KernelBuilder:
                         body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
                         body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
                         body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                        body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                        body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+                        if not (skip_wrap and depth < forest_height):
+                            body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+                            body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                     body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
                     body.append(("store", ("store", tmp_addr, tmp_idx)))
                     body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                     body.append(("store", ("store", tmp_addr, tmp_val)))
             else:
                 for round in range(rounds):
+                    depth = round % (forest_height + 1)
                     if inp_scratch and round == 0:
                         for base in range(0, vec_limit, VLEN):
                             base_const = self.scratch_const(base)
@@ -550,7 +561,8 @@ class KernelBuilder:
                                     )
 
                             # gather node values
-                            if not (small_gather and round in (0, 1)):
+                            depth = round % (forest_height + 1)
+                            if not (small_gather and depth in (0, 1)):
                                 for ui in range(unroll):
                                     base_u = base + ui * VLEN
                                     if base_u >= vec_limit:
@@ -578,14 +590,14 @@ class KernelBuilder:
                                 base_u = base + ui * VLEN
                                 if base_u >= vec_limit:
                                     continue
-                                if small_gather and round == 0:
+                                if small_gather and depth == 0:
                                     body.append(
                                         (
                                             "valu",
                                             ("^", vec_val_u[ui], vec_val_u[ui], vec_forest0),
                                         )
                                     )
-                                elif small_gather and round == 1:
+                                elif small_gather and depth == 1:
                                     # idx is 1 or 2; select forest1/forest2 based on idx % 2
                                     body.append(("valu", ("%", vec_tmp1_u[ui], vec_idx_u[ui], vec_two)))
                                     if arith_select:
@@ -670,28 +682,29 @@ class KernelBuilder:
                                         )
                                 body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
                                 body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
-                                body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
-                                if arith_wrap:
-                                    body.append(("valu", ("*", idx_vec, idx_vec, t1)))
-                                elif arith_select:
-                                    body.append(("valu", ("*", idx_vec, idx_vec, t1)))
-                                elif vselect_valu:
-                                    body.extend(
-                                        self.build_vselect_vec(
-                                            idx_vec,
-                                            t1,
-                                            idx_vec,
-                                            vec_zero,
-                                            t1,
-                                            vec_tmp2_u[vi],
-                                            vec_ones,
-                                            vec_zero,
+                                if not (skip_wrap and depth < forest_height):
+                                    body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
+                                    if arith_wrap:
+                                        body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                                    elif arith_select:
+                                        body.append(("valu", ("*", idx_vec, idx_vec, t1)))
+                                    elif vselect_valu:
+                                        body.extend(
+                                            self.build_vselect_vec(
+                                                idx_vec,
+                                                t1,
+                                                idx_vec,
+                                                vec_zero,
+                                                t1,
+                                                vec_tmp2_u[vi],
+                                                vec_ones,
+                                                vec_zero,
+                                            )
                                         )
-                                    )
-                                else:
-                                    body.append(
-                                        ("flow", ("vselect", idx_vec, t1, idx_vec, vec_zero))
-                                    )
+                                    else:
+                                        body.append(
+                                            ("flow", ("vselect", idx_vec, t1, idx_vec, vec_zero))
+                                        )
                                 if not inp_scratch:
                                     body.append(
                                         ("store", ("vstore", addr_idx_vecs[vi], idx_vec))
@@ -725,13 +738,14 @@ class KernelBuilder:
                                 ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
                             )
                             body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                            body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                            body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                            body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                            body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                            body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                            body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                            body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+                        body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                        body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+                        body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+                        body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                        body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                        body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                        body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+                        if not (skip_wrap and depth < forest_height):
                             body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
                             body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                             body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
