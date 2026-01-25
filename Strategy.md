@@ -132,13 +132,13 @@ approximate cycle impact. All cycle numbers refer to the default workload
 - Gather loads + VALU remain near limits; flow largely removed. Further gains likely need fewer gathers or hash simplification.
 
 ## Current best settings
-- `VEC=1 VLIW=1 VEC_UNROLL=8 SMALL_GATHER=1 SMALL_GATHER_D2=1 SMALL_GATHER_D2_FLOW=1 PER_VALUE_PIPE=1 PARITY_AND=1 ARITH_WRAP=1 SKIP_WRAP=1 SCALAR_OP2=1 MAX_DEPTH_ZERO=1 IDX_MADD=1 IDX_DEPTH0_DIRECT=1`
-- ~1,777 cycles (passes the 1,790 threshold).
+- Best path is now hardcoded (flags removed): VEC+VLIW, unroll=8, per‑value pipeline, depth‑0/1/2 small‑gather, parity via AND, idx update via multiply_add, depth‑0 direct idx, max‑depth idx=0.
+- ~1,773 cycles (passes the 1,790 threshold).
 
 ### Slot utilization and bundle counts
-Engine | Avg/Max | Bundles (out of 1,777)
+Engine | Avg/Max | Bundles (profile @ ~1,773 cycles)
 alu | 9.27 / 12 | 1,333
-valu | 4.21 / 6 | 1,707
-load | 1.85 / 2 | 1,453
+valu | 4.22 / 6 | 1,704
+load | 1.85 / 2 | 1,452
 store | 1.07 / 2 | 60
 flow | 1.00 / 1 | 258
