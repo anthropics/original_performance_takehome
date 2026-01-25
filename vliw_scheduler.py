@@ -28,7 +28,9 @@ class SlotDeps:
     is_store: bool
 
 
-def _slot_deps(engine: str, slot: Tuple) -> SlotDeps:
+def _slot_deps(
+    engine: str, slot: Tuple, *, load_offset_reads_base: bool = False
+) -> SlotDeps:
     """
     Return read/write scratch dependencies for a slot.
 
@@ -112,10 +114,14 @@ def _slot_deps(engine: str, slot: Tuple) -> SlotDeps:
             mem_addr_reg = addr
         elif op == "load_offset":
             _, dest, addr, offset = slot
-            reads.add(addr + offset)
+            if load_offset_reads_base:
+                reads.add(addr)
+            else:
+                reads.add(addr + offset)
             writes.add(dest)
             is_mem = True
             is_store = False
+            # Keep memory keying based on base+offset form for safety.
             mem_addr_reg = addr + offset
         elif op == "vload":
             # ("vload", dest_vec, addr)
@@ -197,15 +203,23 @@ def schedule_slots(
     *,
     serialize_mem: bool = False,
     window: int = 256,
+    disambiguate_mem: bool = False,
+    load_offset_reads_base: bool = False,
 ) -> List[Dict[str, List[Tuple]]]:
     """
     Schedule a sequence of slots into VLIW bundles.
 
     This uses a greedy list scheduler with conservative dependency tracking.
+    Priority is based on longest-path criticality in the dependency graph.
+    Set disambiguate_mem=True to use affine address keys for memory ordering.
+    Set load_offset_reads_base=True if load_offset uses base+imm addressing.
     Returns a list of instruction bundles (dict of engine -> list of slots).
     """
     n = len(slots)
-    deps: List[SlotDeps] = [_slot_deps(engine, slot) for engine, slot in slots]
+    deps: List[SlotDeps] = [
+        _slot_deps(engine, slot, load_offset_reads_base=load_offset_reads_base)
+        for engine, slot in slots
+    ]
 
     # Build dependency graph.
     last_write: Dict[int, int] = {}
@@ -219,6 +233,35 @@ def schedule_slots(
     all_writes = set()
     for dep in deps:
         all_writes.update(dep.writes)
+
+    if disambiguate_mem:
+        affine_key_by_reg: Dict[int, tuple[int, int, tuple[int, ...]] | None] = {}
+        const_val_by_reg: Dict[int, int] = {}
+        uint32_mod = 2**32
+
+        def affine_key(reg: int) -> tuple[int, int, tuple[int, ...]] | None:
+            key = affine_key_by_reg.get(reg)
+            if key is not None:
+                return key
+            if reg not in all_writes:
+                return (reg, 0, (reg,))
+            return None
+
+        def mem_key_for_addr(addr_reg: int) -> tuple:
+            # Group by base stream (base + offset + readonly sources) when known.
+            key = affine_key(addr_reg)
+            if key is None:
+                return ("reg", addr_reg)
+            base_reg, imm_offset, readonly_sources = key
+            return ("affine", base_reg, imm_offset, readonly_sources)
+
+    else:
+
+        def mem_key_for_addr(addr_reg: int) -> tuple:
+            base_key = base_key_by_reg.get(addr_reg)
+            if base_key is None:
+                return ("reg", addr_reg)
+            return ("base", addr_reg, base_key)
 
     succ: Dict[int, List[int]] = defaultdict(list)
     indeg = [0] * n
@@ -243,11 +286,7 @@ def schedule_slots(
             if serialize_mem and last_mem is not None:
                 add_edge(last_mem, i)
             elif dep.mem_addr_reg is not None:
-                base_key = base_key_by_reg.get(dep.mem_addr_reg)
-                if base_key is None:
-                    mem_key = ("reg", dep.mem_addr_reg)
-                else:
-                    mem_key = ("base", dep.mem_addr_reg, base_key)
+                mem_key = mem_key_for_addr(dep.mem_addr_reg)
                 if dep.is_store:
                     if mem_key in last_mem_by_key:
                         add_edge(last_mem_by_key[mem_key], i)
@@ -267,11 +306,7 @@ def schedule_slots(
         if dep.is_mem:
             last_mem = i
             if dep.mem_addr_reg is not None:
-                base_key = base_key_by_reg.get(dep.mem_addr_reg)
-                if base_key is None:
-                    mem_key = ("reg", dep.mem_addr_reg)
-                else:
-                    mem_key = ("base", dep.mem_addr_reg, base_key)
+                mem_key = mem_key_for_addr(dep.mem_addr_reg)
                 last_mem_by_key[mem_key] = i
                 if dep.is_store:
                     last_store_by_key[mem_key] = i
@@ -293,25 +328,120 @@ def schedule_slots(
                 for w in dep.writes:
                     base_key_by_reg[w] = None
 
+        # Optional affine tracking for improved memory disambiguation.
+        if disambiguate_mem and dep.writes:
+            const_updates: Dict[int, int] = {}
+            affine_updates: Dict[int, tuple[int, int, tuple[int, ...]] | None] = {}
+
+            if engine == "load" and slot[0] == "const":
+                _, dest, val = slot
+                const_updates[dest] = val % uint32_mod
+            elif engine == "flow" and slot[0] == "add_imm":
+                _, dest, a, imm = slot
+                base_key = affine_key(a)
+                if base_key is not None:
+                    base_reg, base_off, sources = base_key
+                    affine_updates[dest] = (
+                        base_reg,
+                        (base_off + imm) % uint32_mod,
+                        sources,
+                    )
+                if a in const_val_by_reg:
+                    const_updates[dest] = (const_val_by_reg[a] + imm) % uint32_mod
+            elif engine == "alu" and slot[0] == "+":
+                _, dest, a1, a2 = slot
+                a1_const = const_val_by_reg.get(a1)
+                a2_const = const_val_by_reg.get(a2)
+                if a1_const is not None and a2_const is not None:
+                    const_updates[dest] = (a1_const + a2_const) % uint32_mod
+
+                a1_key = affine_key(a1)
+                a2_key = affine_key(a2)
+                new_key = None
+                if a1_key is not None and a2_const is not None:
+                    base_reg, base_off, sources = a1_key
+                    new_key = (
+                        base_reg,
+                        (base_off + a2_const) % uint32_mod,
+                        sources,
+                    )
+                elif a2_key is not None and a1_const is not None:
+                    base_reg, base_off, sources = a2_key
+                    new_key = (
+                        base_reg,
+                        (base_off + a1_const) % uint32_mod,
+                        sources,
+                    )
+                elif a1_key is not None and a2 not in all_writes:
+                    base_reg, base_off, sources = a1_key
+                    merged = tuple(sorted(set(sources + (a2,))))
+                    new_key = (base_reg, base_off, merged)
+                elif a2_key is not None and a1 not in all_writes:
+                    base_reg, base_off, sources = a2_key
+                    merged = tuple(sorted(set(sources + (a1,))))
+                    new_key = (base_reg, base_off, merged)
+                if new_key is not None:
+                    affine_updates[dest] = new_key
+
+            for w in dep.writes:
+                if w in const_updates:
+                    const_val_by_reg[w] = const_updates[w]
+                else:
+                    const_val_by_reg.pop(w, None)
+                if w in affine_updates:
+                    affine_key_by_reg[w] = affine_updates[w]
+                else:
+                    affine_key_by_reg[w] = None
+
+    # Priority score: longest path to exit (criticality).
+    indeg_tmp = indeg.copy()
+    topo: List[int] = []
+    q = deque(i for i in range(n) if indeg_tmp[i] == 0)
+    while q:
+        node = q.popleft()
+        topo.append(node)
+        for nxt in succ.get(node, []):
+            indeg_tmp[nxt] -= 1
+            if indeg_tmp[nxt] == 0:
+                q.append(nxt)
+    if len(topo) != n:
+        # Graph should be acyclic; fall back to program order if not.
+        topo = list(range(n))
+    priority = [0] * n
+    for node in reversed(topo):
+        if succ.get(node):
+            priority[node] = 1 + max(priority[nxt] for nxt in succ[node])
+
     # Ready queue (stable order)
     ready = deque(i for i in range(n) if indeg[i] == 0)
     scheduled = 0
     bundles: List[Dict[str, List[Tuple]]] = []
 
     engine_priority = ["load", "store", "alu", "valu", "flow", "debug"]
-    engine_weights = {"valu": 3, "load": 2, "store": 1, "alu": 1, "flow": 1, "debug": 0}
+
+    def ready_sort_key(idx: int) -> Tuple[int, int]:
+        # Higher priority first, then lower original index.
+        return (-priority[idx], idx)
 
     while scheduled < n:
         bundle: Dict[str, List[Tuple]] = {}
         used = defaultdict(int)
         picked: List[int] = []
 
-        ready_list = list(ready)
+        ready_full = list(ready)
+        ready_list = ready_full
         if window and len(ready_list) > window:
             ready_list = ready_list[:window]
         picked_set = set()
 
-        # Fill each engine from the ready set with a weighted preference.
+        def pick_idx(idx: int) -> None:
+            engine, slot = slots[idx]
+            bundle.setdefault(engine, []).append(slot)
+            used[engine] += 1
+            picked.append(idx)
+            picked_set.add(idx)
+
+        # Fill each engine from the ready set using priority score.
         for engine in engine_priority:
             limit = slot_limits.get(engine, 0)
             if limit == 0:
@@ -321,22 +451,27 @@ def schedule_slots(
                 for idx in ready_list
                 if idx not in picked_set and slots[idx][0] == engine
             ]
+            if not candidates:
+                continue
+            candidates.sort(key=ready_sort_key)
             for idx in candidates:
                 if used[engine] >= limit:
                     break
-                slot_engine, slot = slots[idx]
-                bundle.setdefault(engine, []).append(slot)
-                used[engine] += 1
-                picked.append(idx)
-                picked_set.add(idx)
+                pick_idx(idx)
+
+        # Opportunistic fill: use remaining capacity across engines by priority.
+        if any(used[e] < slot_limits.get(e, 0) for e in engine_priority):
+            remaining = [idx for idx in ready_full if idx not in picked_set]
+            remaining.sort(key=ready_sort_key)
+            for idx in remaining:
+                engine = slots[idx][0]
+                if used[engine] >= slot_limits.get(engine, 0):
+                    continue
+                pick_idx(idx)
 
         if not picked:
             # If nothing was picked (e.g., only engines with 0 capacity), force-pick the first ready.
-            i = ready_list[0]
-            engine, slot = slots[i]
-            bundle.setdefault(engine, []).append(slot)
-            picked.append(i)
-            picked_set.add(i)
+            pick_idx(ready_full[0])
 
         # Rebuild ready deque without picked items, preserving original order.
         ready = deque(i for i in ready if i not in picked_set)

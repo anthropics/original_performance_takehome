@@ -10,6 +10,9 @@ approximate cycle impact. All cycle numbers refer to the default workload
 ## VLIW scheduling
 - Basic slot packing + dependency-aware scheduling: ~114,966 cycles.
 - More aggressive scheduling (windowed ready set): no measurable change on current best kernels.
+- Critical-path priority scheduling + opportunistic fill (deterministic):
+  - ~1,576 cycles (from ~1,637) on current kernel.
+  - Added optional flags: `disambiguate_mem` (affine mem keys) and `load_offset_reads_base` (ISA semantics); both left off by default.
 
 ## Vectorization
 - VEC (vector ops + scalar gather): large win vs baseline.
@@ -91,7 +94,11 @@ approximate cycle impact. All cycle numbers refer to the default workload
 ## Address setup (stride/pointer bump)
 - Pointer-bump unrolled vector addresses by +VLEN instead of per-ui base constants:
   - ~1,637 cycles (improves ~1,650).
-  - PROFILE=1 bundles: alu 1,251, flow 258, load 1,396, store 32, valu 1,575.
+
+## Scheduler priority (critical path)
+- Priority-based ready selection (longest-path) + opportunistic fill:
+  - ~1,576 cycles (improves ~1,637).
+  - PROFILE=1 bundles: alu 1,245, flow 258, load 1,356, store 26, valu 1,468.
 
 ## Bit-slicing feasibility
 - Bit-slice cost estimate: ~1,280 bitwise ops per value per hash (too expensive to pursue).
@@ -133,6 +140,9 @@ approximate cycle impact. All cycle numbers refer to the default workload
 ### Address setup (pointer bump)
 - Small win by reducing ALU address setup overhead and constant pressure.
 
+### Priority scheduler (critical path)
+- Small win by prioritizing critical ops and filling unused engine slots.
+
 ### Round 2/3 selector attempts
 - Incorrect or slower; rolled back.
 
@@ -144,12 +154,12 @@ approximate cycle impact. All cycle numbers refer to the default workload
 
 ## Current best settings
 - Best path is now hardcoded (flags removed): VEC+VLIW, unroll=20, per‑value pipeline, depth‑0/1/2 small‑gather, parity via AND, idx update via multiply_add, depth‑0 direct idx, max‑depth idx=0.
-- ~1,637 cycles (still above 1,579 but closer).
+- ~1,576 cycles (below 1,579 target, still above 1,548 next threshold in `tests/submission_tests.py`).
 
 ### Slot utilization and bundle counts
-Engine | Avg/Max | Bundles (profile @ ~1,637 cycles)
-alu | 9.86 / 12 | 1,251
-valu | 4.38 / 6 | 1,575
-load | 1.89 / 2 | 1,396
-store | 1.00 / 2 | 32
+Engine | Avg/Max | Bundles (profile @ ~1,576 cycles)
+alu | 9.90 / 12 | 1,245
+valu | 4.70 / 6 | 1,468
+load | 1.94 / 2 | 1,356
+store | 1.23 / 2 | 26
 flow | 1.00 / 1 | 258
