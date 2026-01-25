@@ -42,6 +42,12 @@ approximate cycle impact. All cycle numbers refer to the default workload
   - ~2,108 cycles (beats 2,164 target).
   - Bundles (out of ~2,108): alu 49, flow 34, load 1,914, store 59, valu 2,044.
 
+## Wrap skipping + scalar op2 (vector/ALU mix)
+- SKIP_WRAP=1 (skip idx<n_nodes check except at max depth): ~2,024 cycles.
+- SCALAR_OP2=1 (do op2 in ALU for non-fused stages) + SKIP_WRAP=1:
+  - ~1,969 cycles.
+  - Bundles (out of ~1,969): alu 1,392, flow 66, load 1,662, store 64, valu 1,896.
+
 ## Small-domain gather (attempts that didn’t help)
 - Round 2 exact selector (idx 3..6): slower (rolled back).
 - Round 3 exact selector (idx 7..14): slower (rolled back).
@@ -65,14 +71,57 @@ approximate cycle impact. All cycle numbers refer to the default workload
 ## Bit-slicing feasibility
 - Bit-slice cost estimate: ~1,280 bitwise ops per value per hash (too expensive to pursue).
 
+## Summary (one try per section)
+### Vectorization + VLIW + unroll=8
+- Large win vs scalar; brought cycles down to the low 2K range.
+
+### Per-value pipeline (PER_VALUE_PIPE)
+- Large win by removing per-round input loads/stores.
+
+### Parity via AND + wrap via multiply (PARITY_AND + ARITH_WRAP)
+- Moderate win; reduced flow usage and lowered cycles further.
+
+### Skip wrap except at max depth (SKIP_WRAP)
+- Moderate win; removed redundant bounds checks in most rounds.
+
+### Move op2 to ALU (SCALAR_OP2)
+- Moderate win; reduced VALU pressure by shifting op2 to ALU lanes.
+
+### Hash-stage fusion (multiply_add)
+- Small win; fewer VALU slots in select stages.
+
+### Hash interleaving across unroll
+- Small win; improved slot packing.
+
+### VSELECT_VALU path
+- Regression; VALU saturated and cycles increased.
+
+### INP_SCRATCH
+- No win; reduced load/store counts but no cycle improvement.
+
+### Double-buffer gather (VEC_PIPE)
+- No win; complexity without cycle reduction.
+
+### Unroll > 8
+- Worse or incorrect; scratch pressure and correctness issues.
+
+### Round 2/3 selector attempts
+- Incorrect or slower; rolled back.
+
+### Bit-slicing estimate
+- Too expensive; not pursued.
+
+### Current bottlenecks
+- Gather loads + VALU remain near limits; flow largely removed. Further gains likely need fewer gathers or hash simplification.
+
 ## Current best settings
-- `VEC=1 VLIW=1 VEC_UNROLL=8 SMALL_GATHER=1 PER_VALUE_PIPE=1 PARITY_AND=1 ARITH_WRAP=1`
-- ~2,108 cycles (still above 1,300 target; below 2,164).
+- `VEC=1 VLIW=1 VEC_UNROLL=8 SMALL_GATHER=1 PER_VALUE_PIPE=1 PARITY_AND=1 ARITH_WRAP=1 SKIP_WRAP=1 SCALAR_OP2=1`
+- ~1,969 cycles (still above 1,300 target; below 2,164).
 
 ### Slot utilization and bundle counts
-Engine | Avg/Max | Bundles (out of 2,108)
-alu | 1.37 / 12 | 49
-valu | 5.00 / 6 | 2,044
-load | 1.94 / 2 | 1,914
-store | 1.08 / 2 | 59
-flow | 1.00 / 1 | 34
+Engine | Avg/Max | Bundles (out of 1,969)
+alu | 8.88 / 12 | 1,392
+valu | 4.06 / 6 | 1,896
+load | 1.92 / 2 | 1,662
+store | 1.00 / 2 | 64
+flow | 1.00 / 1 | 66
