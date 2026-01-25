@@ -51,12 +51,37 @@ class KernelBuilder:
         self.const_map = {}
         self.vec_const_map = {}
         self.vec_broadcast_map = {}
+        self.drop_valu_safe_ranges = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]]):
         # Always use VLIW scheduling (best setting).
+        drop_valu = int(os.getenv("DROP_VALU", "0") or 0)
+        drop_safe = os.getenv("DROP_VALU_SAFE", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        if drop_valu > 0:
+            rng = random.Random(0)
+            if drop_safe and self.drop_valu_safe_ranges:
+                valu_idxs = [
+                    i
+                    for i, (engine, slot) in enumerate(slots)
+                    if engine == "valu" and self._drop_valu_safe_slot(slot)
+                ]
+            else:
+                valu_idxs = [
+                    i for i, (engine, _slot) in enumerate(slots) if engine == "valu"
+                ]
+            if drop_valu > len(valu_idxs):
+                drop_valu = len(valu_idxs)
+            drop_set = set(rng.sample(valu_idxs, drop_valu))
+            slots = [slot for i, slot in enumerate(slots) if i not in drop_set]
         return schedule_slots(slots, SLOT_LIMITS)
 
     def add(self, engine, slot):
@@ -74,6 +99,17 @@ class KernelBuilder:
         self.scratch_ptr += length
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
+
+    def mark_drop_valu_safe(self, start, length):
+        self.drop_valu_safe_ranges.append((start, start + length))
+
+    def _drop_valu_safe_slot(self, slot):
+        # Only drop VALU ops that write into explicitly safe vector ranges.
+        dest = slot[1]
+        for start, end in self.drop_valu_safe_ranges:
+            if start <= dest and dest + VLEN <= end:
+                return True
+        return False
 
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
@@ -223,30 +259,32 @@ class KernelBuilder:
         tmp_addr = self.alloc_scratch("tmp_addr")
 
         # Best-settings vector path.
-        unroll = 8
+        unroll = 20
         vec_tmp3 = self.alloc_scratch("vec_tmp3", length=VLEN)
+        vec_tmp4 = self.alloc_scratch("vec_tmp4", length=VLEN)
 
         # Allocate vector pools to avoid scratch overlap between different roles.
-        vec_idx_base = self.alloc_scratch("vec_idx_pool", length=unroll * VLEN)
+        # vec_addr_pool holds per-lane node addresses (forest base + idx).
+        vec_addr_base = self.alloc_scratch("vec_addr_pool", length=unroll * VLEN)
         vec_val_base = self.alloc_scratch("vec_val_pool", length=unroll * VLEN)
+        self.mark_drop_valu_safe(vec_val_base, unroll * VLEN)
         vec_node_base = self.alloc_scratch("vec_node_pool", length=unroll * VLEN)
         vec_tmp1_base = self.alloc_scratch("vec_tmp1_pool", length=unroll * VLEN)
         vec_tmp2_base = self.alloc_scratch("vec_tmp2_pool", length=unroll * VLEN)
-        vec_addr_base = self.alloc_scratch("vec_addr_pool", length=unroll * VLEN)
-        vec_addr_idx_base = self.alloc_scratch("vec_addr_idx_pool", length=unroll)
         vec_addr_val_base = self.alloc_scratch("vec_addr_val_pool", length=unroll)
 
-        vec_idx_u = [vec_idx_base + ui * VLEN for ui in range(unroll)]
+        vec_addr_u = [vec_addr_base + ui * VLEN for ui in range(unroll)]
         vec_val_u = [vec_val_base + ui * VLEN for ui in range(unroll)]
         vec_node_u = [vec_node_base + ui * VLEN for ui in range(unroll)]
         vec_tmp1_u = [vec_tmp1_base + ui * VLEN for ui in range(unroll)]
         vec_tmp2_u = [vec_tmp2_base + ui * VLEN for ui in range(unroll)]
-        vec_addr_u = [vec_addr_base + ui * VLEN for ui in range(unroll)]
-        vec_addr_idx_u = [vec_addr_idx_base + ui for ui in range(unroll)]
         vec_addr_val_u = [vec_addr_val_base + ui for ui in range(unroll)]
         vec_one = self.scratch_vconst(1)
         vec_two = self.scratch_vconst(2)
         vec_forest_base = self.scratch_vbroadcast(self.scratch["forest_values_p"])
+        addr_bias = self.alloc_scratch("addr_bias")
+        base_plus1 = self.alloc_scratch("base_plus1")
+        vec_addr_bias = self.alloc_scratch("vec_addr_bias", length=VLEN)
         # Fixed best-settings flags.
         forest0 = self.alloc_scratch("forest0")
         forest1 = self.alloc_scratch("forest1")
@@ -254,6 +292,11 @@ class KernelBuilder:
         vec_forest0 = self.alloc_scratch("vec_forest0", length=VLEN)
         vec_forest1 = self.alloc_scratch("vec_forest1", length=VLEN)
         vec_forest2 = self.alloc_scratch("vec_forest2", length=VLEN)
+        vec_base1_addr = self.alloc_scratch("vec_base1_addr", length=VLEN)
+        vec_base3_addr = self.alloc_scratch("vec_base3_addr", length=VLEN)
+        body.append(("alu", ("-", addr_bias, one_const, self.scratch["forest_values_p"])))
+        body.append(("alu", ("+", base_plus1, self.scratch["forest_values_p"], one_const)))
+        body.append(("valu", ("vbroadcast", vec_addr_bias, addr_bias)))
         body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], zero_const)))
         body.append(("load", ("load", forest0, tmp_addr)))
         body.append(("valu", ("vbroadcast", vec_forest0, forest0)))
@@ -264,6 +307,8 @@ class KernelBuilder:
         body.append(("load", ("load", forest2, tmp_addr)))
         body.append(("valu", ("vbroadcast", vec_forest2, forest2)))
         vec_base3 = self.scratch_vconst(3)
+        body.append(("valu", ("+", vec_base1_addr, vec_forest_base, vec_one)))
+        body.append(("valu", ("+", vec_base3_addr, vec_forest_base, vec_base3)))
         forest3_6 = []
         forest3_6_consts = []
         vec_forest3_6 = []
@@ -279,22 +324,21 @@ class KernelBuilder:
             forest3_6.append(f)
             forest3_6_consts.append(idx_const)
             vec_forest3_6.append(vf)
-        vec_tmp4 = self.alloc_scratch("vec_tmp4", length=VLEN)
-        
 
         vec_limit = (batch_size // VLEN) * VLEN
         # Per-value pipeline: load each vector chunk once, run all rounds, then store once.
         for base in range(0, vec_limit, VLEN * unroll):
-            # address setup + vload idx/val
+            # address setup + vload values
             for ui in range(unroll):
                 base_u = base + ui * VLEN
                 if base_u >= vec_limit:
                     continue
                 base_u_const = self.scratch_const(base_u)
-                body.append(("alu", ("+", vec_addr_idx_u[ui], self.scratch["inp_indices_p"], base_u_const)))
                 body.append(("alu", ("+", vec_addr_val_u[ui], self.scratch["inp_values_p"], base_u_const)))
-                body.append(("load", ("vload", vec_idx_u[ui], vec_addr_idx_u[ui])))
                 body.append(("load", ("vload", vec_val_u[ui], vec_addr_val_u[ui])))
+                body.append(
+                    ("valu", ("vbroadcast", vec_addr_u[ui], self.scratch["forest_values_p"]))
+                )
             for round in range(rounds):
                 depth = round % (forest_height + 1)
                 # gather node values
@@ -303,12 +347,11 @@ class KernelBuilder:
                         base_u = base + ui * VLEN
                         if base_u >= vec_limit:
                             continue
-                        body.append(("valu", ("+", vec_addr_u[ui], vec_forest_base, vec_idx_u[ui])))
                         for lane in range(VLEN):
                             body.append(("load", ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane)))
                 # process each vector (hash interleaved across unroll)
                 val_groups = []
-                idx_vecs = []
+                addr_vecs = []
                 for ui in range(unroll):
                     base_u = base + ui * VLEN
                     if base_u >= vec_limit:
@@ -316,60 +359,75 @@ class KernelBuilder:
                     if depth == 0:
                         body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_forest0)))
                     elif depth == 1:
-                        body.append(("valu", ("%", vec_tmp1_u[ui], vec_idx_u[ui], vec_two)))
-                        body.append(("flow", ("vselect", vec_node_u[ui], vec_tmp1_u[ui], vec_forest1, vec_forest2)))
+                        body.append(("valu", ("-", vec_tmp1_u[ui], vec_addr_u[ui], vec_base1_addr)))
+                        body.append(("flow", ("vselect", vec_node_u[ui], vec_tmp1_u[ui], vec_forest2, vec_forest1)))
                         body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
                     elif depth == 2:
-                        body.extend(self.build_small_gather_select4_flow(vec_node_u[ui], vec_idx_u[ui], vec_base3, vec_forest3_6, vec_tmp1_u[ui], vec_tmp2_u[ui], vec_tmp4, vec_one))
+                        body.extend(
+                            self.build_small_gather_select4_flow(
+                                vec_node_u[ui],
+                                vec_addr_u[ui],
+                                vec_base3_addr,
+                                vec_forest3_6,
+                                vec_tmp1_u[ui],
+                                vec_tmp2_u[ui],
+                                vec_tmp4,
+                                vec_one,
+                            )
+                        )
                         body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
                     else:
                         body.append(("valu", ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui])))
                     val_groups.append((vec_val_u[ui], vec_tmp1_u[ui], vec_tmp2_u[ui]))
-                    idx_vecs.append(vec_idx_u[ui])
+                    addr_vecs.append(vec_addr_u[ui])
                 body.extend(self.build_hash_vec_multi(val_groups, round, base))
                 for vi, (val_vec, t1, _t2) in enumerate(val_groups):
-                    idx_vec = idx_vecs[vi]
+                    addr_vec = addr_vecs[vi]
                     if depth == forest_height:
-                        body.append(("valu", ("^", idx_vec, idx_vec, idx_vec)))
+                        body.append(
+                            (
+                                "valu",
+                                ("vbroadcast", addr_vec, self.scratch["forest_values_p"]),
+                            )
+                        )
                         continue
                     body.append(("valu", ("&", t1, val_vec, vec_one)))
                     if depth == 0:
-                        body.append(("valu", ("+", idx_vec, t1, vec_one)))
+                        body.append(("valu", ("+", addr_vec, vec_base1_addr, t1)))
                         continue
-                    body.append(("valu", ("multiply_add", idx_vec, idx_vec, vec_two, t1)))
-                    body.append(("valu", ("+", idx_vec, idx_vec, vec_one)))
-            # store idx/val once per chunk
+                    body.append(("valu", ("multiply_add", addr_vec, addr_vec, vec_two, vec_addr_bias)))
+                    body.append(("valu", ("+", addr_vec, addr_vec, t1)))
+                if round == rounds - 1:
+                    continue
+            # store values once per chunk
             for ui in range(unroll):
                 base_u = base + ui * VLEN
                 if base_u >= vec_limit:
                     continue
-                body.append(("store", ("vstore", vec_addr_idx_u[ui], vec_idx_u[ui])))
                 body.append(("store", ("vstore", vec_addr_val_u[ui], vec_val_u[ui])))
         # tail (scalar)
         for i in range(vec_limit, batch_size):
             i_const = self.scratch_const(i)
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-            body.append(("load", ("load", tmp_idx, tmp_addr)))
             body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
             body.append(("load", ("load", tmp_val, tmp_addr)))
+            body.append(("alu", ("+", tmp_idx, self.scratch["forest_values_p"], zero_const)))
             for round in range(rounds):
                 depth = round % (forest_height + 1)
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                body.append(("load", ("load", tmp_node_val, tmp_idx)))
                 body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+                if round == rounds - 1:
+                    continue
                 if depth == forest_height:
-                    body.append(("alu", ("^", tmp_idx, tmp_idx, tmp_idx)))
+                    body.append(("alu", ("+", tmp_idx, self.scratch["forest_values_p"], zero_const)))
                     continue
                 body.append(("alu", ("&", tmp1, tmp_val, one_const)))
                 if depth == 0:
-                    body.append(("alu", ("+", tmp_idx, tmp1, one_const)))
+                    body.append(("alu", ("+", tmp_idx, base_plus1, tmp1)))
                     continue
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                body.append(("alu", ("+", tmp_idx, tmp_idx, addr_bias)))
                 body.append(("alu", ("+", tmp_idx, tmp_idx, tmp1)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, one_const)))
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-            body.append(("store", ("store", tmp_addr, tmp_idx)))
             body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
             body.append(("store", ("store", tmp_addr, tmp_val)))
         body_instrs = self.build(body)
