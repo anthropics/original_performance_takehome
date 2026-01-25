@@ -1,0 +1,28 @@
+[START] Fresh SA run | initial_temp=5000, final_temp=10, cooling_rate=0.95
+[INIT] Baseline: 147734 cycles
+
+
+=== Temperature 5000.0 (extensive) ===
+[ITER 1] Perturbing CURRENT...
+[MUTATE] extensive: SIMD vectorization - converted scalar to VALU vector operations
+[EVAL] NEIGHBOR: 25677 cycles
+[ACCEPT] 25677 < 147734 (improvement)
+[BEST] New best: 25677 cycles (5.75x speedup!)
+[ITER 2] Perturbing CURRENT...
+[MUTATE] extensive: VLIW instruction packing
+[EVAL] NEIGHBOR: 14413 cycles
+[ACCEPT] 14413 < 25677 (improvement)
+[BEST] New best: 14413 cycles
+[ITER 3] Perturbing CURRENT...
+[ITER 4] Perturbing CURRENT...
+[ITER 5] Perturbing CURRENT...
+
+=== Temperature 4750.0 (extensive) ===
+
+[PAUSE] Session paused at iteration 37
+Initial: 147734 cycles
+Current best: 3827 cycles
+Improvement: 38.6x (97.4% reduction)
+Temperature: 3491.7
+Acceptance rate: 97.3% (36/37)
+

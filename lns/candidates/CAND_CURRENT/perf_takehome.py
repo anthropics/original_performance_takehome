@@ -110,19 +110,21 @@ class KernelBuilder:
         for v, _ in needed_vars:
             self.alloc_scratch(v, 1)
 
-        tmp_addrs = [self.alloc_scratch(f"tmp_addr_{i}") for i in range(len(needed_vars) - 1)]
+        tmp_addrs = [self.alloc_scratch(f"tmp_addr_{i}") for i in range(len(needed_vars))]
+        self.instrs.append({"load": [("const", tmp_addrs[0], 1), ("const", tmp_addrs[1], 4)]})
+        self.instrs.append({"load": [("const", tmp_addrs[2], 5), ("const", tmp_addrs[3], 6)]})
+        self.instrs.append({"load": [("load", self.scratch["n_nodes"], tmp_addrs[0]),
+                                      ("load", self.scratch["forest_values_p"], tmp_addrs[1])]})
+        self.instrs.append({"load": [("load", self.scratch["inp_indices_p"], tmp_addrs[2]),
+                                      ("load", self.scratch["inp_values_p"], tmp_addrs[3])]})
+
         one_const = self.alloc_scratch()
         zero_const = self.alloc_scratch()
-        self.instrs.append({"load": [("const", one_const, 1), ("const", tmp_addrs[0], 4)]})
-        self.instrs.append({"load": [("const", tmp_addrs[1], 5), ("const", tmp_addrs[2], 6)]})
-        self.instrs.append({"load": [("load", self.scratch["n_nodes"], one_const),
-                                      ("load", self.scratch["forest_values_p"], tmp_addrs[0])]})
-        self.instrs.append({"load": [("load", self.scratch["inp_indices_p"], tmp_addrs[1]),
-                                      ("load", self.scratch["inp_values_p"], tmp_addrs[2])]})
-
-        self.instrs.append({"load": [("const", zero_const, 0)], "flow": [("pause",)]})
+        self.instrs.append({"load": [("const", one_const, 1), ("const", zero_const, 0)]})
         self.const_map[1] = one_const
         self.const_map[0] = zero_const
+
+        self.add("flow", ("pause",))
 
         body = []
 
@@ -311,14 +313,10 @@ class KernelBuilder:
                         ("multiply_add", addr_vecs[c], idx_chunks[c], bounds_masks[t], forest_p_vec)]
             return []
 
-        gather_node_vals = [self.alloc_scratch(f"gather_nv_{i}", VLEN) for i in range(2)]
-        gather_diff = self.alloc_scratch("gather_diff", VLEN)
-
         for round_num in range(rounds):
             is_last_round = (round_num == rounds - 1)
 
             use_broadcast = (round_num == 0)
-            use_limited_gather_2 = (round_num == 1)
 
             chunk_stage = [-1] * n_chunks
             chunk_loaded = [False] * n_chunks
@@ -328,49 +326,6 @@ class KernelBuilder:
                     chunk_loaded[c] = True
 
                 while any(chunk_stage[c] < 11 for c in range(n_chunks)):
-                    valu_batch = []
-                    for cc in range(n_chunks):
-                        if chunk_loaded[cc] and chunk_stage[cc] < 12 and len(valu_batch) < 6:
-                            ops = get_stage_ops(cc, chunk_stage[cc], hash_t1s, hash_t2s, bounds_masks, n_temps, is_last_round)
-                            if len(valu_batch) + len(ops) <= 6:
-                                valu_batch.extend(ops)
-                                chunk_stage[cc] += 1
-                    if valu_batch:
-                        body.append({"valu": valu_batch})
-                    else:
-                        break
-            elif use_limited_gather_2:
-                body.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], one_const),
-                                     ("+", addr_tmp2, self.scratch["forest_values_p"], mul_2_const)]})
-                body.append({"load": [("load", gather_node_vals[0], addr_tmp),
-                                      ("load", gather_node_vals[0] + 1, addr_tmp2)]})
-                first_5_masks = [("&", hash_t1s[c % n_temps], idx_chunks[c], one_vec) for c in range(min(5, n_chunks))]
-                body.append({"valu": [("vbroadcast", gather_node_vals[0], gather_node_vals[0]),
-                                      ("vbroadcast", gather_node_vals[1], gather_node_vals[0] + 1)] + first_5_masks[:4]})
-                remaining_first_masks = [("&", hash_t1s[c % n_temps], idx_chunks[c], one_vec) for c in range(4, min(6, n_chunks))]
-                body.append({"valu": [("-", gather_diff, gather_node_vals[0], gather_node_vals[1])] + remaining_first_masks})
-
-                for c in range(n_chunks):
-                    chunk_loaded[c] = True
-
-                first_6_selects = [("multiply_add", node_val_vecs[c], gather_diff, hash_t1s[c % n_temps], gather_node_vals[1]) for c in range(min(6, n_chunks))]
-                body.append({"valu": first_6_selects})
-
-                for batch_start in range(6, n_chunks, n_temps):
-                    batch_end = min(batch_start + n_temps, n_chunks)
-                    mask_ops = []
-                    for c in range(batch_start, batch_end):
-                        t = c % n_temps
-                        mask_ops.append(("&", hash_t1s[t], idx_chunks[c], one_vec))
-                    body.append({"valu": mask_ops})
-
-                    select_ops = []
-                    for c in range(batch_start, batch_end):
-                        t = c % n_temps
-                        select_ops.append(("multiply_add", node_val_vecs[c], gather_diff, hash_t1s[t], gather_node_vals[1]))
-                    body.append({"valu": select_ops})
-
-                while any(chunk_stage[cc] < 11 for cc in range(n_chunks)):
                     valu_batch = []
                     for cc in range(n_chunks):
                         if chunk_loaded[cc] and chunk_stage[cc] < 12 and len(valu_batch) < 6:

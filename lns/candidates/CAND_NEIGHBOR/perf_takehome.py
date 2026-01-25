@@ -314,6 +314,7 @@ class KernelBuilder:
         gather_node_vals = [self.alloc_scratch(f"gather_nv_{i}", VLEN) for i in range(2)]
         gather_diff = self.alloc_scratch("gather_diff", VLEN)
 
+        prefetched_round1 = False
         for round_num in range(rounds):
             is_last_round = (round_num == rounds - 1)
 
@@ -327,6 +328,7 @@ class KernelBuilder:
                 for c in range(n_chunks):
                     chunk_loaded[c] = True
 
+                round0_cycles = []
                 while any(chunk_stage[c] < 11 for c in range(n_chunks)):
                     valu_batch = []
                     for cc in range(n_chunks):
@@ -336,14 +338,26 @@ class KernelBuilder:
                                 valu_batch.extend(ops)
                                 chunk_stage[cc] += 1
                     if valu_batch:
-                        body.append({"valu": valu_batch})
+                        round0_cycles.append({"valu": valu_batch})
                     else:
                         break
+
+                if len(round0_cycles) >= 2:
+                    round0_cycles[-2]["alu"] = [("+", addr_tmp, self.scratch["forest_values_p"], one_const),
+                                                 ("+", addr_tmp2, self.scratch["forest_values_p"], mul_2_const)]
+                    round0_cycles[-1]["load"] = [("load", gather_node_vals[0], addr_tmp),
+                                                  ("load", gather_node_vals[0] + 1, addr_tmp2)]
+                    body.extend(round0_cycles)
+                    prefetched_round1 = True
+                else:
+                    body.extend(round0_cycles)
+                    prefetched_round1 = False
             elif use_limited_gather_2:
-                body.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], one_const),
-                                     ("+", addr_tmp2, self.scratch["forest_values_p"], mul_2_const)]})
-                body.append({"load": [("load", gather_node_vals[0], addr_tmp),
-                                      ("load", gather_node_vals[0] + 1, addr_tmp2)]})
+                if not prefetched_round1:
+                    body.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], one_const),
+                                         ("+", addr_tmp2, self.scratch["forest_values_p"], mul_2_const)]})
+                    body.append({"load": [("load", gather_node_vals[0], addr_tmp),
+                                          ("load", gather_node_vals[0] + 1, addr_tmp2)]})
                 first_5_masks = [("&", hash_t1s[c % n_temps], idx_chunks[c], one_vec) for c in range(min(5, n_chunks))]
                 body.append({"valu": [("vbroadcast", gather_node_vals[0], gather_node_vals[0]),
                                       ("vbroadcast", gather_node_vals[1], gather_node_vals[0] + 1)] + first_5_masks[:4]})

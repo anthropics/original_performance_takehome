@@ -1,0 +1,15 @@
+loop_tiling | Break loops into cache-friendly tiles to improve locality
+loop_fusion | Combine multiple loops into one to reduce loop overhead and improve data reuse
+memory_coalescing | Reorganize memory accesses for sequential/strided patterns
+register_blocking | Keep intermediate values in registers across operations
+data_layout_transform | Change data organization (AoS to SoA or vice versa)
+strength_reduction | Replace expensive operations with cheaper equivalents
+computation_reuse | Cache and reuse intermediate results instead of recomputing
+branch_elimination | Remove conditionals using predication or arithmetic
+instruction_interleaving | Interleave independent operations to hide latency
+simd_vectorization | Use VLEN=8 vector operations (valu/vload/vstore) instead of scalar processing
+chunk_sequential_pipeline | Process each chunk through all stages before next chunk, overlapping address computation
+chunk_group_round_fusion | Process small chunk groups through all rounds before next group for temporal locality
+load_compute_overlap | Overlap XOR and hash stage 0 with node value loads for later chunks
+extended_load_overlap | Overlap XOR, hash0, AND hash1 with loads instead of just XOR and hash0
+deep_hash_pipeline | Overlap all 6 hash stages with node value loads using software pipelining
