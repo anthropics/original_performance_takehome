@@ -120,6 +120,11 @@ class KernelBuilder:
 
     def build_hash_vec_multi(self, val_groups, round, base):
         slots = []
+        scalar_op1 = _env_flag("SCALAR_OP1")
+        scalar_op3 = _env_flag("SCALAR_OP3")
+        scalar_op2 = _env_flag("SCALAR_OP2")
+        scalar_xor_op1 = _env_flag("SCALAR_XOR_OP1")
+        scalar_xor_op3 = _env_flag("SCALAR_XOR_OP3")
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             if op2 == "+" and op1 == "+" and op3 == "<<":
                 # (a + val1) + (a << k) == a * (1 + 2^k) + val1
@@ -130,11 +135,24 @@ class KernelBuilder:
                 continue
             c1 = self.scratch_vconst(val1)
             c3 = self.scratch_vconst(val3)
-            for val_vec, t1, _t2 in val_groups:
-                slots.append(("valu", (op1, t1, val_vec, c1)))
-            for val_vec, _t1, t2 in val_groups:
-                slots.append(("valu", (op3, t2, val_vec, c3)))
-            if _env_flag("SCALAR_OP2") and op2 in ("+", "^"):
+            xor_stage = op2 == "^"
+            op1_scalar = scalar_op1 or (scalar_xor_op1 and xor_stage)
+            op3_scalar = scalar_op3 or (scalar_xor_op3 and xor_stage)
+            if op1_scalar:
+                for val_vec, t1, _t2 in val_groups:
+                    for lane in range(VLEN):
+                        slots.append(("alu", (op1, t1 + lane, val_vec + lane, c1 + lane)))
+            else:
+                for val_vec, t1, _t2 in val_groups:
+                    slots.append(("valu", (op1, t1, val_vec, c1)))
+            if op3_scalar:
+                for val_vec, _t1, t2 in val_groups:
+                    for lane in range(VLEN):
+                        slots.append(("alu", (op3, t2 + lane, val_vec + lane, c3 + lane)))
+            else:
+                for val_vec, _t1, t2 in val_groups:
+                    slots.append(("valu", (op3, t2, val_vec, c3)))
+            if scalar_op2 and op2 in ("+", "^"):
                 for val_vec, t1, t2 in val_groups:
                     for lane in range(VLEN):
                         slots.append(("alu", (op2, val_vec + lane, t1 + lane, t2 + lane)))
@@ -152,6 +170,178 @@ class KernelBuilder:
         slots.append(("valu", ("&", dest, a, tmp_mask)))
         slots.append(("valu", ("&", tmp_mask, b, tmp_notmask)))
         slots.append(("valu", ("|", dest, dest, tmp_mask)))
+        return slots
+
+    def build_small_gather_select(
+        self,
+        dest,
+        idx_vec,
+        base_vec,
+        choices,
+        tmp_idx,
+        tmp_mask,
+        tmp_work,
+        vec_zero,
+    ):
+        # Multi-way select: dest = choices[idx_vec - base]
+        slots = []
+        slots.append(("valu", ("-", tmp_idx, idx_vec, base_vec)))
+        for k, vec_val in enumerate(choices):
+            vec_k = self.scratch_vconst(k)
+            slots.append(("valu", ("==", tmp_mask, tmp_idx, vec_k)))
+            slots.append(("valu", ("-", tmp_mask, vec_zero, tmp_mask)))
+            if k == 0:
+                slots.append(("valu", ("&", dest, vec_val, tmp_mask)))
+            else:
+                slots.append(("valu", ("&", tmp_work, vec_val, tmp_mask)))
+                slots.append(("valu", ("|", dest, dest, tmp_work)))
+        return slots
+
+    def build_small_gather_select4(
+        self,
+        dest,
+        idx_vec,
+        base_vec,
+        vals4,
+        tmp_idx,
+        mask0,
+        mask1,
+        tmp_work,
+        tmp_aux,
+        vec_one,
+        vec_zero,
+    ):
+        # 4-way select using bit masks (idx in 0..3)
+        slots = []
+        slots.append(("valu", ("-", tmp_idx, idx_vec, base_vec)))
+        slots.append(("valu", ("&", mask0, tmp_idx, vec_one)))
+        slots.append(("valu", ("-", mask0, vec_zero, mask0)))
+        slots.append(("valu", (">>", mask1, tmp_idx, vec_one)))
+        slots.append(("valu", ("&", mask1, mask1, vec_one)))
+        slots.append(("valu", ("-", mask1, vec_zero, mask1)))
+        # low pair
+        slots.append(("valu", ("^", tmp_work, vals4[0], vals4[1])))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask0)))
+        slots.append(("valu", ("^", dest, vals4[0], tmp_work)))
+        # high pair
+        slots.append(("valu", ("^", tmp_work, vals4[2], vals4[3])))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask0)))
+        slots.append(("valu", ("^", tmp_aux, vals4[2], tmp_work)))
+        # select between low/high
+        slots.append(("valu", ("^", tmp_work, dest, tmp_aux)))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask1)))
+        slots.append(("valu", ("^", dest, dest, tmp_work)))
+        return slots
+
+    def build_small_gather_select4_flow(
+        self,
+        dest,
+        idx_vec,
+        base_vec,
+        vals4,
+        tmp_idx,
+        tmp_bit0,
+        tmp_pair,
+        vec_one,
+    ):
+        # 4-way select using 3 flow vselects; tmp_idx reused for bit1.
+        slots = []
+        slots.append(("valu", ("-", tmp_idx, idx_vec, base_vec)))
+        slots.append(("valu", ("&", tmp_bit0, tmp_idx, vec_one)))
+        slots.append(("valu", (">>", tmp_idx, tmp_idx, vec_one)))
+        slots.append(("valu", ("&", tmp_idx, tmp_idx, vec_one)))
+        slots.append(("flow", ("vselect", dest, tmp_bit0, vals4[1], vals4[0])))
+        slots.append(("flow", ("vselect", tmp_pair, tmp_bit0, vals4[3], vals4[2])))
+        slots.append(("flow", ("vselect", dest, tmp_idx, tmp_pair, dest)))
+        return slots
+
+    def build_small_gather_select8(
+        self,
+        dest,
+        idx_vec,
+        base_vec,
+        vals8,
+        tmp_idx,
+        mask0,
+        mask1,
+        mask2,
+        tmp_work,
+        tmp_aux,
+        vec_one,
+        vec_zero,
+    ):
+        # 8-way select using bit masks (idx in 0..7)
+        slots = []
+        slots.append(("valu", ("-", tmp_idx, idx_vec, base_vec)))
+        slots.append(("valu", ("&", mask0, tmp_idx, vec_one)))
+        slots.append(("valu", ("-", mask0, vec_zero, mask0)))
+        slots.append(("valu", (">>", mask1, tmp_idx, vec_one)))
+        slots.append(("valu", ("&", mask1, mask1, vec_one)))
+        slots.append(("valu", ("-", mask1, vec_zero, mask1)))
+        slots.append(("valu", (">>", mask2, tmp_idx, self.scratch_vconst(2))))
+        slots.append(("valu", ("&", mask2, mask2, vec_one)))
+        slots.append(("valu", ("-", mask2, vec_zero, mask2)))
+        # s0
+        slots.append(("valu", ("^", tmp_work, vals8[0], vals8[1])))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask0)))
+        slots.append(("valu", ("^", dest, vals8[0], tmp_work)))
+        # s1
+        slots.append(("valu", ("^", tmp_work, vals8[2], vals8[3])))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask0)))
+        slots.append(("valu", ("^", tmp_idx, vals8[2], tmp_work)))
+        # t0 = select(s0, s1, mask1) -> dest
+        slots.append(("valu", ("^", tmp_work, dest, tmp_idx)))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask1)))
+        slots.append(("valu", ("^", dest, dest, tmp_work)))
+        # s2
+        slots.append(("valu", ("^", tmp_work, vals8[4], vals8[5])))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask0)))
+        slots.append(("valu", ("^", tmp_idx, vals8[4], tmp_work)))
+        # s3
+        slots.append(("valu", ("^", tmp_work, vals8[6], vals8[7])))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask0)))
+        slots.append(("valu", ("^", tmp_aux, vals8[6], tmp_work)))
+        # t1 = select(s2, s3, mask1) -> tmp_idx
+        slots.append(("valu", ("^", tmp_work, tmp_idx, tmp_aux)))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask1)))
+        slots.append(("valu", ("^", tmp_idx, tmp_idx, tmp_work)))
+        # final select between t0 and t1 with mask2
+        slots.append(("valu", ("^", tmp_work, dest, tmp_idx)))
+        slots.append(("valu", ("&", tmp_work, tmp_work, mask2)))
+        slots.append(("valu", ("^", dest, dest, tmp_work)))
+        return slots
+
+    def build_small_gather_select8_flow(
+        self,
+        dest,
+        idx_vec,
+        base_vec,
+        vals8,
+        tmp_idx,
+        tmp_bit0,
+        tmp_bit1,
+        tmp_pair0,
+        tmp_pair1,
+        vec_one,
+    ):
+        # 8-way select using flow vselects (3 bits).
+        slots = []
+        slots.append(("valu", ("-", tmp_idx, idx_vec, base_vec)))
+        slots.append(("valu", ("&", tmp_bit0, tmp_idx, vec_one)))  # bit0
+        slots.append(("valu", (">>", tmp_bit1, tmp_idx, vec_one)))
+        slots.append(("valu", ("&", tmp_bit1, tmp_bit1, vec_one)))  # bit1
+        slots.append(("valu", (">>", tmp_idx, tmp_idx, self.scratch_vconst(2))))  # bit2 in tmp_idx
+        slots.append(("valu", ("&", tmp_idx, tmp_idx, vec_one)))  # bit2
+        # pairs by bit0
+        slots.append(("flow", ("vselect", tmp_pair0, tmp_bit0, vals8[1], vals8[0])))
+        slots.append(("flow", ("vselect", tmp_pair1, tmp_bit0, vals8[3], vals8[2])))
+        slots.append(("flow", ("vselect", dest, tmp_bit0, vals8[5], vals8[4])))
+        slots.append(("flow", ("vselect", tmp_bit0, tmp_bit0, vals8[7], vals8[6])))
+        # quads by bit1
+        slots.append(("flow", ("vselect", tmp_pair0, tmp_bit1, tmp_pair1, tmp_pair0)))
+        slots.append(("flow", ("vselect", dest, tmp_bit1, tmp_bit0, dest)))
+        # final by bit2
+        slots.append(("flow", ("vselect", dest, tmp_idx, dest, tmp_pair0)))
         return slots
 
     def build_kernel(
@@ -259,7 +449,18 @@ class KernelBuilder:
             parity_and = _env_flag("PARITY_AND")
             arith_wrap = _env_flag("ARITH_WRAP")
             skip_wrap = _env_flag("SKIP_WRAP")
+            max_depth_zero = _env_flag("MAX_DEPTH_ZERO")
+            idx_madd = _env_flag("IDX_MADD")
+            idx_madd_alu_add1 = _env_flag("IDX_MADD_ALU_ADD1")
+            skip_last_idx = _env_flag("SKIP_LAST_IDX")
+            idx_depth0_direct = _env_flag("IDX_DEPTH0_DIRECT")
             small_gather = _env_flag("SMALL_GATHER")
+            small_gather_d2 = small_gather and _env_flag("SMALL_GATHER_D2")
+            small_gather_d3 = small_gather and _env_flag("SMALL_GATHER_D3")
+            small_gather_d2_alu = small_gather_d2 and _env_flag("SMALL_GATHER_D2_ALU")
+            small_gather_d3_alu = small_gather_d3 and _env_flag("SMALL_GATHER_D3_ALU")
+            small_gather_d2_flow = small_gather_d2 and _env_flag("SMALL_GATHER_D2_FLOW")
+            small_gather_d3_flow = small_gather_d3 and _env_flag("SMALL_GATHER_D3_FLOW")
             if small_gather:
                 forest0 = self.alloc_scratch("forest0")
                 forest1 = self.alloc_scratch("forest1")
@@ -276,6 +477,50 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], two_const)))
                 body.append(("load", ("load", forest2, tmp_addr)))
                 body.append(("valu", ("vbroadcast", vec_forest2, forest2)))
+            if small_gather_d2 or small_gather_d3:
+                vec_base3 = self.scratch_vconst(3)
+            if small_gather_d3:
+                vec_base7 = self.scratch_vconst(7)
+                if small_gather_d3 and _env_flag("SMALL_GATHER_D3_FLOW"):
+                    vec_base15 = self.scratch_vconst(15)
+            if small_gather_d2 or small_gather_d3:
+                forest3_6 = []
+                forest3_6_consts = []
+                vec_forest3_6 = []
+                for idx in range(3, 7):
+                    f = self.alloc_scratch(f"forest{idx}")
+                    vf = self.alloc_scratch(f"vec_forest{idx}", length=VLEN)
+                    idx_const = self.scratch_const(idx)
+                    body.append(
+                        ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_const))
+                    )
+                    body.append(("load", ("load", f, tmp_addr)))
+                    body.append(("valu", ("vbroadcast", vf, f)))
+                    forest3_6.append(f)
+                    forest3_6_consts.append(idx_const)
+                    vec_forest3_6.append(vf)
+            if small_gather_d3:
+                forest7_14 = []
+                forest7_14_consts = []
+                vec_forest7_14 = []
+                for idx in range(7, 15):
+                    f = self.alloc_scratch(f"forest{idx}")
+                    vf = self.alloc_scratch(f"vec_forest{idx}", length=VLEN)
+                    idx_const = self.scratch_const(idx)
+                    body.append(
+                        ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_const))
+                    )
+                    body.append(("load", ("load", f, tmp_addr)))
+                    body.append(("valu", ("vbroadcast", vf, f)))
+                    forest7_14.append(f)
+                    forest7_14_consts.append(idx_const)
+                    vec_forest7_14.append(vf)
+            if small_gather_d2 or small_gather_d3:
+                vec_tmp4 = self.alloc_scratch("vec_tmp4", length=VLEN)
+            if small_gather_d3:
+                vec_tmp5 = self.alloc_scratch("vec_tmp5", length=VLEN)
+            if small_gather_d3 and small_gather_d3_flow:
+                vec_tmp6 = self.alloc_scratch("vec_tmp6", length=VLEN)
 
             vec_limit = (batch_size // VLEN) * VLEN
             if per_value_pipe:
@@ -315,7 +560,11 @@ class KernelBuilder:
                     for round in range(rounds):
                         depth = round % (forest_height + 1)
                         # gather node values
-                        if not (small_gather and depth in (0, 1)):
+                        if not (
+                            (small_gather and depth in (0, 1))
+                            or (small_gather_d2 and depth == 2)
+                            or (small_gather_d3 and depth == 3)
+                        ):
                             for ui in range(unroll):
                                 base_u = base + ui * VLEN
                                 if base_u >= vec_limit:
@@ -386,6 +635,131 @@ class KernelBuilder:
                                         ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
                                     )
                                 )
+                            elif small_gather_d2 and depth == 2:
+                                if small_gather_d2_flow:
+                                    body.extend(
+                                        self.build_small_gather_select4_flow(
+                                            vec_node_u[ui],
+                                            vec_idx_u[ui],
+                                            vec_base3,
+                                            vec_forest3_6,
+                                            vec_tmp1_u[ui],
+                                            vec_tmp2_u[ui],
+                                            vec_tmp4,
+                                            vec_one,
+                                        )
+                                    )
+                                elif small_gather_d2_alu:
+                                    for lane in range(VLEN):
+                                        idx_lane = vec_idx_u[ui] + lane
+                                        dest_lane = vec_node_u[ui] + lane
+                                        tmp_eq = vec_tmp1_u[ui] + lane
+                                        tmp_mask = vec_tmp2_u[ui] + lane
+                                        tmp_val = vec_tmp3 + lane
+                                        body.append(("alu", ("+", dest_lane, zero_const, zero_const)))
+                                        for k, faddr in enumerate(forest3_6):
+                                            k_const = forest3_6_consts[k]
+                                            body.append(("alu", ("==", tmp_eq, idx_lane, k_const)))
+                                            body.append(("alu", ("-", tmp_mask, zero_const, tmp_eq)))
+                                            body.append(("alu", ("&", tmp_val, faddr, tmp_mask)))
+                                            body.append(("alu", ("|", dest_lane, dest_lane, tmp_val)))
+                                else:
+                                    body.extend(
+                                        self.build_small_gather_select4(
+                                            vec_node_u[ui],
+                                            vec_idx_u[ui],
+                                            vec_base3,
+                                            vec_forest3_6,
+                                            vec_tmp1_u[ui],
+                                            vec_tmp2_u[ui],
+                                            vec_tmp3,
+                                            vec_tmp4,
+                                            vec_tmp1_u[ui],
+                                            vec_one,
+                                            vec_zero,
+                                        )
+                                    )
+                                body.append(
+                                    (
+                                        "valu",
+                                        ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
+                                    )
+                                )
+                            elif small_gather_d3 and depth == 3:
+                                if small_gather_d3_flow:
+                                    # Fallback gather (general case)
+                                    body.append(
+                                        (
+                                            "valu",
+                                            ("+", vec_addr_u[ui], vec_forest_base, vec_idx_u[ui]),
+                                        )
+                                    )
+                                    for lane in range(VLEN):
+                                        body.append(
+                                            (
+                                                "load",
+                                                ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane),
+                                            )
+                                        )
+                                    # Fast select for idx in [7,15)
+                                    body.extend(
+                                        self.build_small_gather_select8_flow(
+                                            vec_tmp6,
+                                            vec_idx_u[ui],
+                                            vec_base7,
+                                            vec_forest7_14,
+                                            vec_tmp1_u[ui],
+                                            vec_tmp2_u[ui],
+                                            vec_tmp3,
+                                            vec_tmp4,
+                                            vec_tmp5,
+                                            vec_one,
+                                        )
+                                    )
+                                    body.append(("valu", ("<", vec_tmp2_u[ui], vec_idx_u[ui], vec_base7)))
+                                    body.append(("valu", ("-", vec_tmp2_u[ui], vec_zero, vec_tmp2_u[ui])))
+                                    body.append(("valu", ("<", vec_tmp3, vec_idx_u[ui], vec_base15)))
+                                    body.append(("valu", ("&", vec_tmp4, vec_tmp2_u[ui], vec_tmp3)))
+                                    body.append(
+                                        ("flow", ("vselect", vec_node_u[ui], vec_tmp4, vec_tmp6, vec_node_u[ui]))
+                                    )
+                                elif small_gather_d3_alu:
+                                    for lane in range(VLEN):
+                                        idx_lane = vec_idx_u[ui] + lane
+                                        dest_lane = vec_node_u[ui] + lane
+                                        tmp_eq = vec_tmp1_u[ui] + lane
+                                        tmp_mask = vec_tmp2_u[ui] + lane
+                                        tmp_val = vec_tmp3 + lane
+                                        body.append(("alu", ("+", dest_lane, zero_const, zero_const)))
+                                        for k, faddr in enumerate(forest7_14):
+                                            k_const = forest7_14_consts[k]
+                                            body.append(("alu", ("==", tmp_eq, idx_lane, k_const)))
+                                            body.append(("alu", ("-", tmp_mask, zero_const, tmp_eq)))
+                                            body.append(("alu", ("&", tmp_val, faddr, tmp_mask)))
+                                            body.append(("alu", ("|", dest_lane, dest_lane, tmp_val)))
+                                else:
+                                    body.extend(
+                                        self.build_small_gather_select8(
+                                            vec_node_u[ui],
+                                            vec_idx_u[ui],
+                                            vec_base7,
+                                            vec_forest7_14,
+                                            vec_tmp1_u[ui],
+                                            vec_tmp2_u[ui],
+                                            vec_tmp3,
+                                            vec_tmp4,
+                                            vec_tmp5,
+                                            vec_tmp1_u[ui],
+                                            vec_one,
+                                            vec_zero,
+                                        )
+                                    )
+                                body.append(
+                                    (
+                                        "valu",
+                                        ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
+                                    )
+                                )
                             else:
                                 body.append(
                                     (
@@ -400,9 +774,27 @@ class KernelBuilder:
 
                         for vi, (val_vec, t1, _t2) in enumerate(val_groups):
                             idx_vec = idx_vecs[vi]
+                            if skip_last_idx and round == rounds - 1:
+                                continue
+                            if max_depth_zero and depth == forest_height:
+                                body.append(("valu", ("^", idx_vec, idx_vec, idx_vec)))
+                                continue
                             if parity_and:
                                 body.append(("valu", ("&", t1, val_vec, vec_one)))
-                                body.append(("valu", ("+", vec_tmp3, t1, vec_one)))
+                                if idx_depth0_direct and depth == 0:
+                                    body.append(("valu", ("+", idx_vec, t1, vec_one)))
+                                    continue
+                                if idx_madd:
+                                    body.append(("valu", ("multiply_add", idx_vec, idx_vec, vec_two, t1)))
+                                    if idx_madd_alu_add1:
+                                        for lane in range(VLEN):
+                                            body.append(
+                                                ("alu", ("+", idx_vec + lane, idx_vec + lane, one_const))
+                                            )
+                                    else:
+                                        body.append(("valu", ("+", idx_vec, idx_vec, vec_one)))
+                                else:
+                                    body.append(("valu", ("+", vec_tmp3, t1, vec_one)))
                             else:
                                 body.append(("valu", ("%", t1, val_vec, vec_two)))
                                 body.append(("valu", ("==", t1, t1, vec_zero)))
@@ -425,8 +817,15 @@ class KernelBuilder:
                                     body.append(
                                         ("flow", ("vselect", vec_tmp3, t1, vec_one, vec_two))
                                     )
-                            body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
-                            body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
+                                if idx_depth0_direct and depth == 0:
+                                    body.append(("valu", ("+", idx_vec, vec_tmp3, vec_zero)))
+                                    continue
+                            if parity_and and idx_madd:
+                                # idx already updated via multiply_add above
+                                pass
+                            else:
+                                body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
+                                body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
                             if not (skip_wrap and depth < forest_height):
                                 body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
                                 if arith_wrap:
@@ -562,7 +961,11 @@ class KernelBuilder:
 
                             # gather node values
                             depth = round % (forest_height + 1)
-                            if not (small_gather and depth in (0, 1)):
+                            if not (
+                                (small_gather and depth in (0, 1))
+                                or (small_gather_d2 and depth == 2)
+                                or (small_gather_d3 and depth == 3)
+                            ):
                                 for ui in range(unroll):
                                     base_u = base + ui * VLEN
                                     if base_u >= vec_limit:
@@ -635,6 +1038,131 @@ class KernelBuilder:
                                             ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
                                         )
                                     )
+                                elif small_gather_d2 and depth == 2:
+                                    if small_gather_d2_flow:
+                                        body.extend(
+                                            self.build_small_gather_select4_flow(
+                                                vec_node_u[ui],
+                                                vec_idx_u[ui],
+                                                vec_base3,
+                                                vec_forest3_6,
+                                                vec_tmp1_u[ui],
+                                                vec_tmp2_u[ui],
+                                                vec_tmp4,
+                                                vec_one,
+                                            )
+                                        )
+                                    elif small_gather_d2_alu:
+                                        for lane in range(VLEN):
+                                            idx_lane = vec_idx_u[ui] + lane
+                                            dest_lane = vec_node_u[ui] + lane
+                                            tmp_eq = vec_tmp1_u[ui] + lane
+                                            tmp_mask = vec_tmp2_u[ui] + lane
+                                            tmp_val = vec_tmp3 + lane
+                                            body.append(("alu", ("+", dest_lane, zero_const, zero_const)))
+                                            for k, faddr in enumerate(forest3_6):
+                                                k_const = forest3_6_consts[k]
+                                                body.append(("alu", ("==", tmp_eq, idx_lane, k_const)))
+                                                body.append(("alu", ("-", tmp_mask, zero_const, tmp_eq)))
+                                                body.append(("alu", ("&", tmp_val, faddr, tmp_mask)))
+                                                body.append(("alu", ("|", dest_lane, dest_lane, tmp_val)))
+                                    else:
+                                        body.extend(
+                                            self.build_small_gather_select4(
+                                                vec_node_u[ui],
+                                                vec_idx_u[ui],
+                                                vec_base3,
+                                                vec_forest3_6,
+                                                vec_tmp1_u[ui],
+                                                vec_tmp2_u[ui],
+                                                vec_tmp3,
+                                                vec_tmp4,
+                                                vec_tmp1_u[ui],
+                                                vec_one,
+                                                vec_zero,
+                                            )
+                                        )
+                                    body.append(
+                                        (
+                                            "valu",
+                                            ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
+                                        )
+                                    )
+                                elif small_gather_d3 and depth == 3:
+                                    if small_gather_d3_flow:
+                                        body.append(
+                                            (
+                                                "valu",
+                                                ("+", vec_addr_u[ui], vec_forest_base, vec_idx_u[ui]),
+                                            )
+                                        )
+                                        for lane in range(VLEN):
+                                            body.append(
+                                                (
+                                                    "load",
+                                                    ("load_offset", vec_node_u[ui], vec_addr_u[ui], lane),
+                                                )
+                                            )
+                                        body.extend(
+                                            self.build_small_gather_select8_flow(
+                                                vec_tmp6,
+                                                vec_idx_u[ui],
+                                                vec_base7,
+                                                vec_forest7_14,
+                                                vec_tmp1_u[ui],
+                                                vec_tmp2_u[ui],
+                                                vec_tmp3,
+                                                vec_tmp4,
+                                                vec_tmp5,
+                                                vec_one,
+                                            )
+                                        )
+                                        body.append(
+                                            ("valu", ("<", vec_tmp2_u[ui], vec_idx_u[ui], vec_base7))
+                                        )
+                                        body.append(("valu", ("-", vec_tmp2_u[ui], vec_zero, vec_tmp2_u[ui])))
+                                        body.append(("valu", ("<", vec_tmp3, vec_idx_u[ui], vec_base15)))
+                                        body.append(("valu", ("&", vec_tmp4, vec_tmp2_u[ui], vec_tmp3)))
+                                        body.append(
+                                            ("flow", ("vselect", vec_node_u[ui], vec_tmp4, vec_tmp6, vec_node_u[ui]))
+                                        )
+                                    elif small_gather_d3_alu:
+                                        for lane in range(VLEN):
+                                            idx_lane = vec_idx_u[ui] + lane
+                                            dest_lane = vec_node_u[ui] + lane
+                                            tmp_eq = vec_tmp1_u[ui] + lane
+                                            tmp_mask = vec_tmp2_u[ui] + lane
+                                            tmp_val = vec_tmp3 + lane
+                                            body.append(("alu", ("+", dest_lane, zero_const, zero_const)))
+                                            for k, faddr in enumerate(forest7_14):
+                                                k_const = forest7_14_consts[k]
+                                                body.append(("alu", ("==", tmp_eq, idx_lane, k_const)))
+                                                body.append(("alu", ("-", tmp_mask, zero_const, tmp_eq)))
+                                                body.append(("alu", ("&", tmp_val, faddr, tmp_mask)))
+                                                body.append(("alu", ("|", dest_lane, dest_lane, tmp_val)))
+                                    else:
+                                        body.extend(
+                                            self.build_small_gather_select8(
+                                                vec_node_u[ui],
+                                                vec_idx_u[ui],
+                                                vec_base7,
+                                                vec_forest7_14,
+                                                vec_tmp1_u[ui],
+                                                vec_tmp2_u[ui],
+                                                vec_tmp3,
+                                                vec_tmp4,
+                                                vec_tmp5,
+                                                vec_tmp1_u[ui],
+                                                vec_one,
+                                                vec_zero,
+                                            )
+                                        )
+                                    body.append(
+                                        (
+                                            "valu",
+                                            ("^", vec_val_u[ui], vec_val_u[ui], vec_node_u[ui]),
+                                        )
+                                    )
                                 else:
                                     body.append(
                                         (
@@ -655,9 +1183,27 @@ class KernelBuilder:
 
                             for vi, (val_vec, t1, _t2) in enumerate(val_groups):
                                 idx_vec = idx_vecs[vi]
+                                if skip_last_idx and round == rounds - 1:
+                                    continue
+                                if max_depth_zero and depth == forest_height:
+                                    body.append(("valu", ("^", idx_vec, idx_vec, idx_vec)))
+                                    continue
                                 if parity_and:
                                     body.append(("valu", ("&", t1, val_vec, vec_one)))
-                                    body.append(("valu", ("+", vec_tmp3, t1, vec_one)))
+                                    if idx_depth0_direct and depth == 0:
+                                        body.append(("valu", ("+", idx_vec, t1, vec_one)))
+                                        continue
+                                    if idx_madd:
+                                        body.append(("valu", ("multiply_add", idx_vec, idx_vec, vec_two, t1)))
+                                        if idx_madd_alu_add1:
+                                            for lane in range(VLEN):
+                                                body.append(
+                                                    ("alu", ("+", idx_vec + lane, idx_vec + lane, one_const))
+                                                )
+                                        else:
+                                            body.append(("valu", ("+", idx_vec, idx_vec, vec_one)))
+                                    else:
+                                        body.append(("valu", ("+", vec_tmp3, t1, vec_one)))
                                 else:
                                     body.append(("valu", ("%", t1, val_vec, vec_two)))
                                     body.append(("valu", ("==", t1, t1, vec_zero)))
@@ -680,8 +1226,14 @@ class KernelBuilder:
                                         body.append(
                                             ("flow", ("vselect", vec_tmp3, t1, vec_one, vec_two))
                                         )
-                                body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
-                                body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
+                                    if idx_depth0_direct and depth == 0:
+                                        body.append(("valu", ("+", idx_vec, vec_tmp3, vec_zero)))
+                                        continue
+                                if parity_and and idx_madd:
+                                    pass
+                                else:
+                                    body.append(("valu", ("*", idx_vec, idx_vec, vec_two)))
+                                    body.append(("valu", ("+", idx_vec, idx_vec, vec_tmp3)))
                                 if not (skip_wrap and depth < forest_height):
                                     body.append(("valu", ("<", t1, idx_vec, vec_n_nodes)))
                                     if arith_wrap:
@@ -740,18 +1292,26 @@ class KernelBuilder:
                             body.append(("load", ("load", tmp_node_val, tmp_addr)))
                         body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
                         body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                        body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                        body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                        body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                        body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                        body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                        if not (skip_wrap and depth < forest_height):
-                            body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                            body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                            body.append(("store", ("store", tmp_addr, tmp_idx)))
-                            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                            body.append(("store", ("store", tmp_addr, tmp_val)))
+                        if skip_last_idx and round == rounds - 1:
+                            pass
+                        elif max_depth_zero and depth == forest_height:
+                            body.append(("alu", ("^", tmp_idx, tmp_idx, tmp_idx)))
+                        else:
+                            body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+                            body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                            body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                            if idx_depth0_direct and depth == 0:
+                                body.append(("alu", ("+", tmp_idx, tmp3, zero_const)))
+                            else:
+                                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+                            if not (skip_wrap and depth < forest_height):
+                                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+                                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+                        body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                        body.append(("store", ("store", tmp_addr, tmp_idx)))
+                        body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                        body.append(("store", ("store", tmp_addr, tmp_val)))
                     if inp_scratch and round == rounds - 1:
                         for base in range(0, vec_limit, VLEN):
                             base_const = self.scratch_const(base)
