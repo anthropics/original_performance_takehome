@@ -93,14 +93,19 @@ class KernelBuilder:
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
         return slots
-    
+
     def build_vhash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("valu", (op1, tmp1, val_hash_addr, self.scratch_vconst(val1))))
-            slots.append(("valu", (op3, tmp2, val_hash_addr, self.scratch_vconst(val3))))
-            slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # Use multiply_add
+                factor = 1 + (1 << val3)
+                slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr, self.scratch_vconst(factor), self.scratch_vconst(val1))))
+            else:
+                slots.append(("valu", (op1, tmp1, val_hash_addr, self.scratch_vconst(val1))))
+                slots.append(("valu", (op3, tmp2, val_hash_addr, self.scratch_vconst(val3))))
+                slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
             slots.append(("debug", ("vcompare", val_hash_addr, [(round, i+idx, "hash_stage", hi) for idx in range(VLEN)])))
         
         return slots
@@ -145,6 +150,23 @@ class KernelBuilder:
         for i in range(1, batch_size):
             self.add("alu", ("+", idx_ptrs + i, idx_ptrs + i - 1, one_const))
             self.add("alu", ("+", val_ptrs + i, val_ptrs + i - 1, one_const))
+        
+        # Vector scratch registers and broadcasted constants.
+        vtmp1 = self.alloc_scratch("vtmp1", VLEN)
+        vtmp2 = self.alloc_scratch("vtmp2", VLEN)
+        vtmp3 = self.alloc_scratch("vtmp3", VLEN)
+
+        vone_const = self.scratch_vconst(1, "vone")
+        vtwo_const = self.scratch_vconst(2, "vtwo")
+
+        vtmp_idx = self.alloc_scratch("vtmp_idx", VLEN)
+        vtmp_val = self.alloc_scratch("vtmp_val", VLEN)
+        vtmp_node_val = self.alloc_scratch("vtmp_node_val", VLEN)
+        vtmp_addr = self.alloc_scratch("vtmp_addr", VLEN)
+        
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+        v_forest_p = self.scratch_vconst(self.scratch["forest_values_p"])
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -163,37 +185,37 @@ class KernelBuilder:
         tmp_addr = self.alloc_scratch("tmp_addr")
 
         for round in range(rounds):
-            for i in range(batch_size):
+            for i in range(0, batch_size, VLEN):
                 # idx = mem[inp_indices_p + i]
                 idx_ptr = idx_ptrs + i
-                body.append(("load", ("load", tmp_idx, idx_ptr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+                body.append(("load", ("vload", vtmp_idx, idx_ptr)))
+                body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "idx") for j in range(VLEN)])))
                 # val = mem[inp_values_p + i]
                 val_ptr = val_ptrs + i
-                body.append(("load", ("load", tmp_val, val_ptr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+                body.append(("load", ("vload", vtmp_val, val_ptr)))
+                body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "val") for j in range(VLEN)])))
                 # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                body.append(("valu", ("+", vtmp_addr, v_forest_p, vtmp_idx)))
+                for j in range(VLEN):
+                    body.append(("load", ("load_offset", vtmp_node_val, vtmp_addr, j)))
+                body.append(("debug", ("vcompare", vtmp_node_val, [(round, i+j, "node_val") for j in range(VLEN)])))
                 # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+                body.append(("valu", ("^", vtmp_val, vtmp_val, vtmp_node_val)))
+                body.extend(self.build_vhash(vtmp_val, vtmp1, vtmp2, round, i))
+                body.append(("debug", ("vcompare", vtmp_val, [(round, i+j, "hashed_val") for j in range(VLEN)])))
                 # Change to idx = 2*idx + 1 + (val % 2)
-                body.append(("alu", ("%", tmp3, tmp_val, two_const)))
-                body.append(("alu", ("+", tmp3, tmp3, one_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+                body.append(("valu", ("&", vtmp3, vtmp_val, vone_const)))
+                body.append(("valu", ("+", vtmp3, vtmp3, vone_const)))
+                body.append(("valu", ("multiply_add", vtmp_idx, vtmp_idx, vtwo_const, vtmp3)))
+                body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "next_idx") for j in range(VLEN)])))
                 # Change to idx = idx * (idx < n_nodes)
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("alu", ("*", tmp_idx, tmp1, tmp_idx)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
+                body.append(("valu", ("<", vtmp1, vtmp_idx, v_n_nodes)))
+                body.append(("valu", ("*", vtmp_idx, vtmp1, vtmp_idx)))
+                body.append(("debug", ("vcompare", vtmp_idx, [(round, i+j, "wrapped_idx") for j in range(VLEN)])))
                 # mem[inp_indices_p + i] = idx
-                body.append(("store", ("store", idx_ptr, tmp_idx)))
+                body.append(("store", ("vstore", idx_ptr, vtmp_idx)))
                 # mem[inp_values_p + i] = val
-                body.append(("store", ("store", val_ptr, tmp_val)))
+                body.append(("store", ("vstore", val_ptr, vtmp_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
