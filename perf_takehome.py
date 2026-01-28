@@ -44,6 +44,7 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vconst_map = {}
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -73,6 +74,14 @@ class KernelBuilder:
             self.add("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
+    
+    def scratch_vconst(self, val, name=None):
+        if val not in self.vconst_map:
+            addr = self.alloc_scratch(name, length=VLEN)
+            scalar_addr = self.scratch_const(val)
+            self.add("valu", ("vbroadcast", addr, scalar_addr))
+            self.vconst_map[val] = addr
+        return self.vconst_map[val]
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
@@ -84,14 +93,27 @@ class KernelBuilder:
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
         return slots
+    
+    def build_vhash(self, val_hash_addr, tmp1, tmp2, round, i):
+        slots = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            slots.append(("valu", (op1, tmp1, val_hash_addr, self.scratch_vconst(val1))))
+            slots.append(("valu", (op3, tmp2, val_hash_addr, self.scratch_vconst(val3))))
+            slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+            slots.append(("debug", ("vcompare", val_hash_addr, [(round, i+idx, "hash_stage", hi) for idx in range(VLEN)])))
+        
+        return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Vectorized implementation using SIMD for batch dimension.
+        Assume batch_size is a multiple of VLEN.
         """
+        num_blocks = batch_size // VLEN
+
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
@@ -115,6 +137,15 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        # Precompute the idx: inp_indices_p + i and inp_values_p + i
+        idx_ptrs = self.alloc_scratch("idx_ptrs", batch_size)
+        val_ptrs = self.alloc_scratch("val_ptrs", batch_size)
+        self.add("alu", ("+", idx_ptrs, self.scratch["inp_indices_p"], zero_const))
+        self.add("alu", ("+", val_ptrs, self.scratch["inp_values_p"], zero_const))
+        for i in range(1, batch_size):
+            self.add("alu", ("+", idx_ptrs + i, idx_ptrs + i - 1, one_const))
+            self.add("alu", ("+", val_ptrs + i, val_ptrs + i - 1, one_const))
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -130,15 +161,6 @@ class KernelBuilder:
         tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
-
-        # Precompute the idx: inp_indices_p + i and inp_values_p + i
-        idx_ptrs = self.alloc_scratch("idx_ptrs", batch_size)
-        val_ptrs = self.alloc_scratch("val_ptrs", batch_size)
-        self.add("alu", ("+", idx_ptrs, self.scratch["inp_indices_p"], zero_const))
-        self.add("alu", ("+", val_ptrs, self.scratch["inp_values_p"], zero_const))
-        for i in range(1, batch_size):
-            self.add("alu", ("+", idx_ptrs + i, idx_ptrs + i - 1, one_const))
-            self.add("alu", ("+", val_ptrs + i, val_ptrs + i - 1, one_const))
 
         for round in range(rounds):
             for i in range(batch_size):
