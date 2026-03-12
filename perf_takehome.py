@@ -122,17 +122,19 @@ class KernelBuilder:
         tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
+        idx_into_btree = self.alloc_scratch("idx_into_betree") 
+        idx_into_values = self.alloc_scratch("idx_into_values")
 
         for i in range(batch_size):
             for round in range(rounds):
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                self.add("load", ("load", tmp_idx, tmp_addr))
+                self.add("alu", ("+", idx_into_btree, self.scratch["inp_indices_p"], i_const))
+                self.add("load", ("load", tmp_idx, idx_into_btree))
                 self.add("debug", ("compare", tmp_idx, (round, i, "idx")))
                 # val = mem[inp_values_p + i]
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                self.add("load", ("load", tmp_val, tmp_addr))
+                self.add("alu", ("+", idx_into_values, self.scratch["inp_values_p"], i_const))
+                self.add("load", ("load", tmp_val, idx_into_values))
                 self.add("debug", ("compare", tmp_val, (round, i, "val")))
                 # node_val = mem[forest_values_p + idx]
                 self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
@@ -154,11 +156,9 @@ class KernelBuilder:
                 self.add("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const))
                 self.add("debug", ("compare", tmp_idx, (round, i, "wrapped_idx")))
                 # mem[inp_indices_p + i] = idx
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                self.add("store", ("store", tmp_addr, tmp_idx))
+                self.add("store", ("store", idx_into_btree, tmp_idx))
                 # mem[inp_values_p + i] = val
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                self.add("store", ("store", tmp_addr, tmp_val))
+                self.add("store", ("store", idx_into_values, tmp_val))
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
