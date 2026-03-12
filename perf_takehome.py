@@ -125,7 +125,7 @@ class KernelBuilder:
         idx_into_btree = self.alloc_scratch("idx_into_betree") 
         idx_into_values = self.alloc_scratch("idx_into_values")
 
-        for i in range(batch_size):
+        for i in range(batch_size): # 256
             i_const = self.scratch_const(i)
             # idx = mem[inp_indices_p + i]
             # val = mem[inp_values_p + i]
@@ -137,7 +137,7 @@ class KernelBuilder:
                 ("load", tmp_idx, idx_into_btree),
                 ("load", tmp_val, idx_into_values)
             ])
-            for round in range(rounds):
+            for round in range(rounds): # 10
                 # node_val = mem[forest_values_p + idx]
                 self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
                 self.add("load", ("load", tmp_node_val, tmp_addr))
@@ -146,7 +146,7 @@ class KernelBuilder:
                 self.add("alu", ("^", tmp_val, tmp_val, tmp_node_val))
                 self.build_hash(tmp_val, tmp1, tmp2, round, i)
                 self.add("debug", ("compare", tmp_val, (round, i, "hashed_val")))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                # idx = 2*idx + (1 if val % 2 == 0 else 2
                 self.add("alu", ("%", tmp1, tmp_val, two_const))
                 self.add("alu", ("==", tmp1, tmp1, zero_const))
                 self.add("flow", ("select", tmp3, tmp1, one_const, two_const))
@@ -157,10 +157,10 @@ class KernelBuilder:
                 self.add("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"]))
                 self.add("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const))
                 self.add("debug", ("compare", tmp_idx, (round, i, "wrapped_idx")))
-                # mem[inp_indices_p + i] = idx
-                self.add("store", ("store", idx_into_btree, tmp_idx))
-                # mem[inp_values_p + i] = val
-                self.add("store", ("store", idx_into_values, tmp_val))
+            # mem[inp_indices_p + i] = idx
+            self.add("store", ("store", idx_into_btree, tmp_idx))
+            # mem[inp_values_p + i] = val
+            self.add("store", ("store", idx_into_values, tmp_val))
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
