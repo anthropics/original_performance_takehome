@@ -126,16 +126,18 @@ class KernelBuilder:
         idx_into_values = self.alloc_scratch("idx_into_values")
 
         for i in range(batch_size):
+            i_const = self.scratch_const(i)
+            # idx = mem[inp_indices_p + i]
+            # val = mem[inp_values_p + i]
+            self.add_multiple("alu", [
+                ("+", idx_into_btree, self.scratch["inp_indices_p"], i_const),
+                ("+", idx_into_values, self.scratch["inp_values_p"], i_const)
+            ])
+            self.add_multiple("load", [
+                ("load", tmp_idx, idx_into_btree),
+                ("load", tmp_val, idx_into_values)
+            ])
             for round in range(rounds):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                self.add("alu", ("+", idx_into_btree, self.scratch["inp_indices_p"], i_const))
-                self.add("load", ("load", tmp_idx, idx_into_btree))
-                self.add("debug", ("compare", tmp_idx, (round, i, "idx")))
-                # val = mem[inp_values_p + i]
-                self.add("alu", ("+", idx_into_values, self.scratch["inp_values_p"], i_const))
-                self.add("load", ("load", tmp_val, idx_into_values))
-                self.add("debug", ("compare", tmp_val, (round, i, "val")))
                 # node_val = mem[forest_values_p + idx]
                 self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
                 self.add("load", ("load", tmp_node_val, tmp_addr))
