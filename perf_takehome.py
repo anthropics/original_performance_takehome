@@ -79,6 +79,69 @@ class KernelBuilder:
             self.add("alu", (op2, val_hash_addr, tmp1, tmp2))
             self.add("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
 
+    def bulk_load_into_scratch_space(self, batch_size: int):
+        batch_offset_values = self.alloc_scratch("batch_offset_values", batch_size) 
+        batch_offset_indicies = self.alloc_scratch("batch_offset_indicies", batch_size)
+        index_into_memory1 = self.alloc_scratch("index_into_memory1")
+        index_into_memory2 = self.alloc_scratch("index_into_memory2")
+        for s in range(batch_size // VLEN // 2):
+            memory_offset1 = self.scratch_const(s * VLEN)
+            memory_offset2 = self.scratch_const(s * VLEN + VLEN)
+            self.add_multiple("alu", [
+                ("+", index_into_memory1, self.scratch["inp_values_p"], memory_offset1),
+                ("+", index_into_memory2, self.scratch["inp_values_p"], memory_offset2)
+            ])
+            self.add_multiple("load", [
+                ("vload", batch_offset_values + (s * VLEN * 2), index_into_memory1),
+                ("vload", batch_offset_values + (s * VLEN * 2) + VLEN, index_into_memory2)
+            ])
+            self.add_multiple("load", [
+                ("vload", batch_offset_values + (s * VLEN * 2), memory_offset1),
+                ("vload", batch_offset_values + (s * VLEN * 2) + VLEN, memory_offset2)
+            ])
+
+    def build_kernel_optimized(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
+        """
+
+        1. bulk load entire batch from memory into scratch space
+
+        for each round:
+
+        2. use valu to compute XOR of value and node value
+
+        3. use valu to iterate through the hash stages
+
+        end for loop
+
+        4. write back results into memory 
+
+        """
+        # Scratch space addresses
+        init_vars = [
+            "rounds",
+            "n_nodes",
+            "batch_size",
+            "forest_height",
+            "forest_values_p",
+            "inp_indices_p",
+            "inp_values_p",
+        ]
+        tmp1 = self.alloc_scratch("tmp1")
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        for i, v in enumerate(init_vars):
+            self.add("load", ("const", tmp1, i))
+            self.add("load", ("load", self.scratch[v], tmp1))
+        self.add("flow", ("pause",))
+
+        batch_values_offset, batch_indicies_offset = self.bulk_load_into_scratch_space(batch_size)
+    
+
+
+        self.instrs.append({"flow": [("pause",)]})
+
+
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -161,7 +224,7 @@ class KernelBuilder:
             self.add("store", ("store", idx_into_btree, tmp_idx))
             # mem[inp_values_p + i] = val
             self.add("store", ("store", idx_into_values, tmp_val))
-
+        
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
