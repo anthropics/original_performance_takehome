@@ -151,7 +151,7 @@ class KernelBuilder:
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
                 body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+                body.append(("alu", ("&", tmp1, tmp_val, two_const)))
                 body.append(("alu", ("==", tmp1, tmp1, zero_const)))
                 body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
