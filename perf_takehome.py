@@ -144,27 +144,90 @@ class KernelBuilder:
             ("vstore", store_addr2, batch_indices_offset + (n_chunks - 1) * VLEN)
         ])
 
+    def _build_gather_instrs(self, vv, vi, k, v_nv, ta, fvp):
+        """Build gather instruction list (ALU+LOAD only, no VALU).
+        Returns list of instruction dicts for pipelined address computation + loads."""
+        instrs = []
+        # Build flat list of all load pairs
+        all_loads = []
+        for i in range(k):
+            for j in range(0, VLEN, 2):
+                all_loads.append((v_nv[i] + j, ta[i] + j,
+                                  v_nv[i] + j + 1, ta[i] + j + 1))
+        # First chunk ALU (standalone)
+        instrs.append({"alu": [
+            ("+", ta[0] + j, fvp, vi[0] + j) for j in range(VLEN)
+        ]})
+        # Subsequent chunks: overlap ALU with first load pair of prev chunk
+        li = 0
+        for i in range(1, k):
+            lp = all_loads[li]
+            instrs.append({
+                "alu": [("+", ta[i] + j, fvp, vi[i] + j) for j in range(VLEN)],
+                "load": [("load", lp[0], lp[1]), ("load", lp[2], lp[3])]
+            })
+            li += 1
+        # Remaining loads
+        for idx in range(li, len(all_loads)):
+            lp = all_loads[idx]
+            instrs.append({"load": [
+                ("load", lp[0], lp[1]), ("load", lp[2], lp[3])
+            ]})
+        return instrs
+
+    def _build_compute_instrs(self, vv, vi, k, v_nv, v_t1, v_t2, vhc, v_one, v_two, v_nn):
+        """Build compute instruction list (VALU only).
+        Returns list of 18 instruction dicts: XOR(1) + hash(12) + index(5)."""
+        instrs = []
+        # XOR
+        instrs.append({"valu": [("^", vv[i], vv[i], v_nv[i]) for i in range(k)]})
+        # Hash stages (interleaved across k chunks)
+        for si, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            h1, h3 = vhc[si]
+            ops = []
+            for i in range(k):
+                ops.extend([(op1, v_t1[i], vv[i], h1),
+                            (op3, v_t2[i], vv[i], h3)])
+            instrs.append({"valu": ops})
+            instrs.append({"valu": [(op2, vv[i], v_t1[i], v_t2[i]) for i in range(k)]})
+        # Index update (pure arithmetic)
+        step1 = []
+        for i in range(k):
+            step1.extend([("&", v_t1[i], vv[i], v_one),
+                          ("*", vi[i], vi[i], v_two)])
+        instrs.append({"valu": step1})
+        instrs.append({"valu": [("+", v_t1[i], v_t1[i], v_one) for i in range(k)]})
+        instrs.append({"valu": [("+", vi[i], vi[i], v_t1[i]) for i in range(k)]})
+        instrs.append({"valu": [("<", v_t1[i], vi[i], v_nn) for i in range(k)]})
+        instrs.append({"valu": [("*", vi[i], vi[i], v_t1[i]) for i in range(k)]})
+        return instrs
+
+    def _emit_overlapped(self, compute_instrs, gather_instrs):
+        """Merge compute (VALU) and gather (ALU+LOAD) instruction lists.
+        No engine conflicts since they use completely separate engines."""
+        n = max(len(compute_instrs), len(gather_instrs))
+        for i in range(n):
+            merged = {}
+            if i < len(compute_instrs):
+                merged.update(compute_instrs[i])
+            if i < len(gather_instrs):
+                merged.update(gather_instrs[i])
+            self.instrs.append(merged)
+
     def build_kernel_optimized(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
         """
-        Vectorized kernel using valu and v* operations.
+        Vectorized kernel with software pipeline to hide load latency.
 
-        1. bulk load entire batch from memory into scratch space
-        for each chunk of VLEN elements:
-          for each round:
-            2. gather node values (scalar loads since indices are non-contiguous)
-            3. use valu to compute XOR and iterate through hash stages
-            4. use valu/vselect for index update
-        5. write back results into memory
+        Key optimizations:
+        - 3-chunk interleaving fills 6/6 valu slots during hash ops
+        - Arithmetic index update (no flow engine)
+        - Inter-group pipeline: overlap next group's gather (LOAD+ALU) with
+          current group's compute (VALU) since they use separate engines
         """
         # Scratch space addresses
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         tmp1 = self.alloc_scratch("tmp1")
         for v in init_vars:
@@ -175,89 +238,74 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         # 1. Bulk load values and indices into scratch
-        batch_values_offset, batch_indices_offset = self.bulk_load_into_scratch_space(batch_size)
+        bv, bi = self.bulk_load_into_scratch_space(batch_size)
 
-        # Allocate vector working space
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
-        tmp_addrs = self.alloc_scratch("tmp_addrs", VLEN)
+        # 3 sets of vector temporaries for up to 3-chunk interleaving
+        MAX_K = 3
+        v_nv = [self.alloc_scratch(f"v_nv_{i}", VLEN) for i in range(MAX_K)]
+        v_t1 = [self.alloc_scratch(f"v_t1_{i}", VLEN) for i in range(MAX_K)]
+        v_t2 = [self.alloc_scratch(f"v_t2_{i}", VLEN) for i in range(MAX_K)]
+        ta = [self.alloc_scratch(f"ta_{i}", VLEN) for i in range(MAX_K)]
 
         # Broadcast scalar constants to vectors
-        v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
-
-        zero_s = self.scratch_const(0)
-        one_s = self.scratch_const(1)
-        two_s = self.scratch_const(2)
+        v_nn = self.alloc_scratch("v_nn", VLEN)
 
         self.add_multiple("valu", [
-            ("vbroadcast", v_zero, zero_s),
-            ("vbroadcast", v_one, one_s),
-            ("vbroadcast", v_two, two_s),
-            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+            ("vbroadcast", v_one, self.scratch_const(1)),
+            ("vbroadcast", v_two, self.scratch_const(2)),
+            ("vbroadcast", v_nn, self.scratch["n_nodes"]),
         ])
 
         # Pre-broadcast hash constants into vectors
-        v_hash_consts = []
+        vhc = []
         for si, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            v_val1 = self.alloc_scratch(f"vh1_{si}", VLEN)
-            v_val3 = self.alloc_scratch(f"vh3_{si}", VLEN)
+            h1 = self.alloc_scratch(f"vh1_{si}", VLEN)
+            h3 = self.alloc_scratch(f"vh3_{si}", VLEN)
             self.add_multiple("valu", [
-                ("vbroadcast", v_val1, self.scratch_const(val1)),
-                ("vbroadcast", v_val3, self.scratch_const(val3)),
+                ("vbroadcast", h1, self.scratch_const(val1)),
+                ("vbroadcast", h3, self.scratch_const(val3)),
             ])
-            v_hash_consts.append((v_val1, v_val3))
+            vhc.append((h1, h3))
 
-        # Main computation loop
+        fvp = self.scratch["forest_values_p"]
+
+        # Build group definitions: list of (vv, vi, k) for each group
         n_chunks = batch_size // VLEN
-        for c in range(n_chunks):
-            v_val = batch_values_offset + c * VLEN
-            v_idx = batch_indices_offset + c * VLEN
+        groups = []
+        c = 0
+        while c < n_chunks:
+            k = min(MAX_K, n_chunks - c)
+            vv = [bv + (c + i) * VLEN for i in range(k)]
+            vi = [bi + (c + i) * VLEN for i in range(k)]
+            groups.append((vv, vi, k))
+            c += k
 
-            for r in range(rounds):
-                # Gather node values: compute addr[j] = forest_values_p + idx[j]
-                self.add_multiple("alu", [
-                    ("+", tmp_addrs + j, self.scratch["forest_values_p"], v_idx + j)
-                    for j in range(VLEN)
-                ])
-                # Scalar loads for non-contiguous node values (2 per cycle)
-                for j in range(0, VLEN, 2):
-                    self.add_multiple("load", [
-                        ("load", v_node_val + j, tmp_addrs + j),
-                        ("load", v_node_val + j + 1, tmp_addrs + j + 1),
-                    ])
+        # Software pipeline: overlap next group's gather with current group's compute
+        for r in range(rounds):
+            # First group: standalone gather
+            vv0, vi0, k0 = groups[0]
+            gather_0 = self._build_gather_instrs(vv0, vi0, k0, v_nv, ta, fvp)
+            self.instrs.extend(gather_0)
 
-                # XOR val with node_val
-                self.add("valu", ("^", v_val, v_val, v_node_val))
+            for g in range(len(groups)):
+                vv_g, vi_g, k_g = groups[g]
+                compute = self._build_compute_instrs(
+                    vv_g, vi_g, k_g, v_nv, v_t1, v_t2, vhc, v_one, v_two, v_nn)
 
-                # Hash stages
-                for si, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    vh1, vh3 = v_hash_consts[si]
-                    self.add_multiple("valu", [
-                        (op1, v_tmp1, v_val, vh1),
-                        (op3, v_tmp2, v_val, vh3),
-                    ])
-                    self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
+                if g + 1 < len(groups):
+                    # Overlap: current compute (VALU) + next gather (ALU+LOAD)
+                    vv_next, vi_next, k_next = groups[g + 1]
+                    next_gather = self._build_gather_instrs(
+                        vv_next, vi_next, k_next, v_nv, ta, fvp)
+                    self._emit_overlapped(compute, next_gather)
+                else:
+                    # Last group: standalone compute
+                    self.instrs.extend(compute)
 
-                # Index update: idx = 2*idx + (1 if val%2==0 else 2)
-                self.add("valu", ("%", v_tmp1, v_val, v_two))
-                self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
-                # Overlap vselect (flow) with multiply (valu) - independent operations
-                self.instrs.append({
-                    "flow": [("vselect", v_tmp3, v_tmp1, v_one, v_two)],
-                    "valu": [("*", v_idx, v_idx, v_two)],
-                })
-                self.add("valu", ("+", v_idx, v_idx, v_tmp3))
-                # Wrap: idx = 0 if idx >= n_nodes else idx
-                self.add("valu", ("<", v_tmp1, v_idx, v_n_nodes))
-                self.add("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))
-
-        # 5. Write back results to memory
-        self.bulk_store_to_memory(batch_size, batch_values_offset, batch_indices_offset)
+        # Write back results to memory
+        self.bulk_store_to_memory(batch_size, bv, bi)
 
         self.instrs.append({"flow": [("pause",)]})
 
