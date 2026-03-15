@@ -175,43 +175,92 @@ class KernelBuilder:
             ]})
         return instrs
 
-    def _build_compute_instrs(self, vv, vi, k, v_nv, v_t1, v_t2, vhc, v_one, v_two, v_nn):
-        """Build compute instruction list (VALU only).
-        Returns list of 18 instruction dicts: XOR(1) + hash(12) + index(5)."""
+    def _build_compute_instrs(self, vv, vi, k, v_nv, v_t1, v_t2, vhc,
+                              v_one, v_two, v_nn, one_s, two_s):
+        """Build compute instruction list: VALU + ALU idx precompute.
+        Returns list of 14 instruction dicts: XOR(1) + hash(9, with ALU) + index(4).
+
+        3 fusible hash stages use multiply_add (1 cycle instead of 2).
+        During hash, ALU precomputes idx = 2*idx + 1 (scalar ops)."""
         instrs = []
-        # XOR
+
+        # XOR (1 cycle, VALU only)
         instrs.append({"valu": [("^", vv[i], vv[i], v_nv[i]) for i in range(k)]})
-        # Hash stages (interleaved across k chunks)
-        for si, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            h1, h3 = vhc[si]
-            ops = []
-            for i in range(k):
-                ops.extend([(op1, v_t1[i], vv[i], h1),
-                            (op3, v_t2[i], vv[i], h3)])
-            instrs.append({"valu": ops})
-            instrs.append({"valu": [(op2, vv[i], v_t1[i], v_t2[i]) for i in range(k)]})
-        # Index update (pure arithmetic)
-        step1 = []
+
+        # Build ALU ops for idx precompute: multiply by 2, then add 1
+        mul_ops = []
+        add_ops = []
         for i in range(k):
-            step1.extend([("&", v_t1[i], vv[i], v_one),
-                          ("*", vi[i], vi[i], v_two)])
-        instrs.append({"valu": step1})
-        instrs.append({"valu": [("+", v_t1[i], v_t1[i], v_one) for i in range(k)]})
+            for j in range(VLEN):
+                mul_ops.append(("*", vi[i] + j, vi[i] + j, two_s))
+                add_ops.append(("+", vi[i] + j, vi[i] + j, one_s))
+        # Split into chunks of max 12 (ALU slot limit)
+        alu_schedule = (
+            [mul_ops[x:x+12] for x in range(0, len(mul_ops), 12)] +
+            [add_ops[x:x+12] for x in range(0, len(add_ops), 12)]
+        )
+
+        # Hash stages with ALU injected for idx precompute
+        # Fusible stages (op1="+", op2="+", op3="<<"): 1 cycle via multiply_add
+        # Non-fusible stages: 2 cycles (ops + merge)
+        hash_cycle = 0  # tracks position in hash for ALU injection
+        ALU_INJECT_START = 2
+        for si, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            h1, h3, vm = vhc[si]
+            if vm is not None:
+                # Fusible: val = val * multiplier + const1 (single multiply_add)
+                fma_instr = {"valu": [("multiply_add", vv[i], vv[i], vm, h1) for i in range(k)]}
+                alu_offset = hash_cycle - ALU_INJECT_START
+                if 0 <= alu_offset < len(alu_schedule):
+                    fma_instr["alu"] = alu_schedule[alu_offset]
+                instrs.append(fma_instr)
+                hash_cycle += 1
+            else:
+                # Non-fusible: 2 cycles (ops + merge)
+                ops = []
+                for i in range(k):
+                    ops.extend([(op1, v_t1[i], vv[i], h1),
+                                (op3, v_t2[i], vv[i], h3)])
+                ops_instr = {"valu": ops}
+                merge_instr = {"valu": [(op2, vv[i], v_t1[i], v_t2[i]) for i in range(k)]}
+
+                alu_offset = hash_cycle - ALU_INJECT_START
+                if 0 <= alu_offset < len(alu_schedule):
+                    ops_instr["alu"] = alu_schedule[alu_offset]
+                alu_offset = hash_cycle + 1 - ALU_INJECT_START
+                if 0 <= alu_offset < len(alu_schedule):
+                    merge_instr["alu"] = alu_schedule[alu_offset]
+
+                instrs.append(ops_instr)
+                instrs.append(merge_instr)
+                hash_cycle += 2
+
+        # Index update (4 VALU cycles — the *2 and +1 were done by ALU above)
+        # bit = val & 1
+        instrs.append({"valu": [("&", v_t1[i], vv[i], v_one) for i in range(k)]})
+        # idx += bit (idx is already 2*old_idx+1 from ALU precompute)
         instrs.append({"valu": [("+", vi[i], vi[i], v_t1[i]) for i in range(k)]})
+        # flag = (idx < n_nodes)
         instrs.append({"valu": [("<", v_t1[i], vi[i], v_nn) for i in range(k)]})
+        # idx *= flag (wraps to 0 if out of bounds)
         instrs.append({"valu": [("*", vi[i], vi[i], v_t1[i]) for i in range(k)]})
         return instrs
 
     def _emit_overlapped(self, compute_instrs, gather_instrs):
-        """Merge compute (VALU) and gather (ALU+LOAD) instruction lists.
-        No engine conflicts since they use completely separate engines."""
+        """Merge compute and gather instruction lists.
+        Safely combines slot lists when both have the same engine key."""
         n = max(len(compute_instrs), len(gather_instrs))
         for i in range(n):
             merged = {}
             if i < len(compute_instrs):
-                merged.update(compute_instrs[i])
+                for key, val in compute_instrs[i].items():
+                    merged[key] = val
             if i < len(gather_instrs):
-                merged.update(gather_instrs[i])
+                for key, val in gather_instrs[i].items():
+                    if key in merged:
+                        merged[key] = merged[key] + val  # combine slot lists
+                    else:
+                        merged[key] = val
             self.instrs.append(merged)
 
     def build_kernel_optimized(self, forest_height: int, n_nodes: int, batch_size: int, rounds: int):
@@ -259,15 +308,29 @@ class KernelBuilder:
         ])
 
         # Pre-broadcast hash constants into vectors
+        # For fusible stages (op1="+", op2="+", op3="<<"):
+        #   val = val * (1 + 2^shift) + const1  →  single multiply_add
         vhc = []
         for si, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            h1 = self.alloc_scratch(f"vh1_{si}", VLEN)
-            h3 = self.alloc_scratch(f"vh3_{si}", VLEN)
-            self.add_multiple("valu", [
-                ("vbroadcast", h1, self.scratch_const(val1)),
-                ("vbroadcast", h3, self.scratch_const(val3)),
-            ])
-            vhc.append((h1, h3))
+            fusible = (op1 == "+" and op2 == "+" and op3 == "<<")
+            if fusible:
+                # Only need h1 (additive const) and multiplier
+                h1 = self.alloc_scratch(f"vh1_{si}", VLEN)
+                vm = self.alloc_scratch(f"vm_{si}", VLEN)
+                multiplier = 1 + (1 << val3)  # 1 + 2^shift
+                self.add_multiple("valu", [
+                    ("vbroadcast", h1, self.scratch_const(val1)),
+                    ("vbroadcast", vm, self.scratch_const(multiplier)),
+                ])
+                vhc.append((h1, None, vm))  # (const, None, multiplier)
+            else:
+                h1 = self.alloc_scratch(f"vh1_{si}", VLEN)
+                h3 = self.alloc_scratch(f"vh3_{si}", VLEN)
+                self.add_multiple("valu", [
+                    ("vbroadcast", h1, self.scratch_const(val1)),
+                    ("vbroadcast", h3, self.scratch_const(val3)),
+                ])
+                vhc.append((h1, h3, None))  # (const1, const2, None=not fusible)
 
         fvp = self.scratch["forest_values_p"]
 
@@ -292,7 +355,8 @@ class KernelBuilder:
             for g in range(len(groups)):
                 vv_g, vi_g, k_g = groups[g]
                 compute = self._build_compute_instrs(
-                    vv_g, vi_g, k_g, v_nv, v_t1, v_t2, vhc, v_one, v_two, v_nn)
+                    vv_g, vi_g, k_g, v_nv, v_t1, v_t2, vhc, v_one, v_two, v_nn,
+                    self.scratch_const(1), self.scratch_const(2))
 
                 if g + 1 < len(groups):
                     # Overlap: current compute (VALU) + next gather (ALU+LOAD)
