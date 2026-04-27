@@ -22,6 +22,47 @@ While it's no longer a good time-limited test, you can still use this test to ge
 
 Run `python tests/submission_tests.py` to see which thresholds you pass.
 
+## Leaderboard submission
+
+This branch is set up for copy-paste submission:
+
+- `perf_takehome.py` contains the validated submission wired into the repo.
+- `build_kernel_submission.txt` contains the exact self-contained `build_kernel` method to paste into the leaderboard editor.
+
+Validation on this branch:
+
+```bash
+python3 tests/submission_tests.py
+```
+
+The current frozen submission result is **1,319 cycles** for the standard `forest_height=10`, `rounds=16`, `batch_size=256` benchmark. The same copy-paste method was also checked for correctness across tree depths 8-10, rounds 8/12/16/20, and batch sizes 128/256.
+
+### Techniques used
+
+The submission is a self-contained method: it defines the optimized helper builder inside `build_kernel`, generates the VLIW program, then copies the generated instructions and scratch metadata back onto the starter `KernelBuilder`.
+
+The main performance techniques are:
+
+- Keep all batch values and indices resident in scratch across rounds, then store final values once.
+- Vectorize the batch in `VLEN=8` chunks and schedule across multiple chunk groups.
+- Use a critical-path list scheduler with explicit scratch and memory dependency tracking.
+- Specialize cheap forest levels: root broadcast, level-1 select, level-2 pair select, and partial level-3 select.
+- Use an `8x3` temporary-bank layout to keep enough independent chunks in flight without exceeding the 1,536-word scratch limit.
+- Balance hash work between ALU and VALU with per-level and per-round masks.
+- Move one level-0 branch-update chunk onto ALU to fill scheduler slack.
+
+### Profiling lessons
+
+The most useful profiling result was separating **resource floors** from **scheduled cycles**. The optimized kernel has a much lower theoretical floor than the emitted schedule, but after the major structural wins most local scheduler and mask tweaks produced only single-digit gains.
+
+Specific lessons:
+
+- Forest gathers dominate early until resident state and level-specialized loads remove avoidable traffic.
+- Generic forest caches and broad compare/select distribution are usually too expensive; saving load words is not enough if VALU/flow distribution costs more.
+- Scratch pressure is a first-order constraint. Many promising ideas failed because the final useful shape already uses about 1,534 / 1,536 scratch words.
+- Scheduler changes should be guided by DAG/resource stats, not by broad priority guesses. Tie-break and weighted-priority variants mostly tied or regressed.
+- Once the load/VALU/ALU floors are close, per-round masks can matter more than per-level defaults because late-round slack differs from early-round slack.
+
 ## Warning: LLMs can cheat
 
 None of the solutions we received on the first day post-release below 1300 cycles were valid solutions. In each case, a language model modified the tests to make the problem easier.
